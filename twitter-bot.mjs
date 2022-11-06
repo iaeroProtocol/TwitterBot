@@ -28,6 +28,9 @@ const twitterClient = new TwitterApi({
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
+const DEBUG_STATS = process.env.DEBUG_STATS === '1';
+
+
 /* ---------------- Topics ---------------- */
 const PROTOCOL_TOPICS = [
   "How iAERO's liquid staking works",
@@ -202,16 +205,20 @@ async function fetchGitBookContent() {
 async function getProtocolStats() {
   const provider = new ethers.JsonRpcProvider(process.env.RPC_URL || 'https://mainnet.base.org');
 
+  // Addresses (override via env to be 100% sure they match prod)
   const VAULT_ADDRESS   = process.env.VAULT_ADDRESS   || '0x877398Aea8B5cCB0D482705c2D88dF768c953957';
   const IAERO_AERO_POOL = process.env.IAERO_AERO_POOL || '0x08d49DA370ecfFBC4c6Fdd2aE82B2D6aE238Affd';
   const LIQ_USDC_POOL   = process.env.LIQ_USDC_POOL   || '0x8966379fCD16F7cB6c6EA61077B6c4fAfECa28f4';
   const AERO_USDC_POOL  = process.env.AERO_USDC_POOL  || '0x6cDcb1C4A4D1C3C6d054b27AC5B77e89eAFb971d';
-  const USDC_ADDRESS    = process.env.USDC_ADDRESS    || '0x833589fcd6edb6e08f4c7c32d4f71b54bda02913';
+  const USDC_ADDRESS    = process.env.USDC_ADDRESS    || '0x833589fCD6EDb6E08f4c7C32D4f71b54bdA02913';
 
+  // Minimal ABI for vault reads
   const VAULT_ABI = [
     'function totalAEROLocked() view returns (uint256)',
     'function totalLIQMinted() view returns (uint256)',
-    'function totalIAEROMinted() view returns (uint256)'
+    'function totalIAEROMinted() view returns (uint256)',
+    // fallback view in case the above is not behaving
+    'function vaultStatus() view returns (uint256,uint256,uint256,uint256,uint256,uint256,uint256,uint256,uint256,bool,bool)'
   ];
 
   const vault = new ethers.Contract(VAULT_ADDRESS, VAULT_ABI, provider);
@@ -221,58 +228,93 @@ async function getProtocolStats() {
   let iAeroMintedNum = 0;
 
   let aeroPrice = NaN;
-  let liqPrice = NaN;
-  let iaeroPeg = NaN;
+  let liqPrice  = NaN;
+  let iaeroPeg  = NaN;
 
-  // Vault metrics (sequential, clear error surface)
+  /* -------- 1) Vault metrics with robust fallback -------- */
   try {
     const totalAEROLocked = await vault.totalAEROLocked();
     aeroLockedNum = parseFloat(ethers.formatEther(totalAEROLocked));
   } catch (e) {
-    console.error('totalAEROLocked failed:', e?.message || e);
+    console.error('totalAEROLocked() failed:', e?.message || e);
   }
+
+  // Fallback if zero (common cause of $0 TVL)
+  if (!aeroLockedNum) {
+    try {
+      const vs = await vault.vaultStatus();
+      // vs[0] = totalUserDeposits = totalAEROLocked (per your contract)
+      aeroLockedNum = parseFloat(ethers.formatEther(vs[0]));
+      if (DEBUG_STATS) console.log('[DEBUG] vaultStatus fallback totalAEROLocked:', aeroLockedNum);
+    } catch (e) {
+      console.error('vaultStatus() fallback failed:', e?.message || e);
+    }
+  }
+
   try {
     const totalLIQMinted = await vault.totalLIQMinted();
     liqMintedNum = parseFloat(ethers.formatEther(totalLIQMinted));
   } catch (e) {
-    console.error('totalLIQMinted failed:', e?.message || e);
+    console.error('totalLIQMinted() failed:', e?.message || e);
   }
+
   try {
     const totalIAEROMinted = await vault.totalIAEROMinted();
     iAeroMintedNum = parseFloat(ethers.formatEther(totalIAEROMinted));
   } catch (e) {
-    console.error('totalIAEROMinted failed:', e?.message || e);
+    console.error('totalIAEROMinted() failed:', e?.message || e);
   }
 
-  // Pair-based prices
+  /* -------- 2) Resolve tokens and prices safely -------- */
   try {
     const { tokens, decimals } = await resolveCoreTokens(provider, {
       AERO_USDC_POOL, LIQ_USDC_POOL, IAERO_AERO_POOL, USDC: USDC_ADDRESS
     });
 
-    try { aeroPrice = await pairPrice(provider, AERO_USDC_POOL,  tokens.AERO,  tokens.USDC, decimals); }
-    catch (e) { console.error('AERO price failed:', e?.message || e); }
+    if (DEBUG_STATS) {
+      console.log('[DEBUG] Resolved tokens:', tokens);
+    }
 
-    try { liqPrice  = await pairPrice(provider, LIQ_USDC_POOL,  tokens.LIQ,   tokens.USDC, decimals); }
-    catch (e) { console.error('LIQ price failed:', e?.message || e); }
+    try {
+      aeroPrice = await pairPrice(provider, AERO_USDC_POOL, tokens.AERO, tokens.USDC, decimals);
+    } catch (e) {
+      console.error('AERO price failed:', e?.message || e);
+    }
 
-    try { iaeroPeg  = await pairPrice(provider, IAERO_AERO_POOL, tokens.IAERO, tokens.AERO, decimals); }
-    catch (e) { console.error('iAERO peg failed:', e?.message || e); }
-  } catch (err) {
-    console.error('Token resolution/decimals failed:', err?.message || err);
+    try {
+      liqPrice = await pairPrice(provider, LIQ_USDC_POOL, tokens.LIQ, tokens.USDC, decimals);
+    } catch (e) {
+      console.error('LIQ price failed:', e?.message || e);
+    }
+
+    try {
+      iaeroPeg = await pairPrice(provider, IAERO_AERO_POOL, tokens.IAERO, tokens.AERO, decimals);
+    } catch (e) {
+      console.error('iAERO peg failed:', e?.message || e);
+    }
+  } catch (e) {
+    console.error('Token resolution/decimals failed:', e?.message || e);
   }
 
-  const tvl = isFinite(aeroPrice) ? aeroLockedNum * aeroPrice : 0;
+  /* -------- 3) Derived values (with guards) -------- */
+  const tvlFloat = isFinite(aeroPrice) ? aeroLockedNum * aeroPrice : 0;
 
+  if (DEBUG_STATS) {
+    console.log('[DEBUG] aeroLockedNum:', aeroLockedNum);
+    console.log('[DEBUG] aeroPrice:', aeroPrice);
+    console.log('[DEBUG] tvlFloat:', tvlFloat);
+  }
+
+  /* -------- 4) Return tweet-friendly shape -------- */
   return {
-    tvl:        compactUSDorToken(tvl),
-    apy:        '30', // placeholder
+    tvl:         compactUSDorToken(tvlFloat),
+    apy:         '30', // still placeholder until you wire real APY logic
     totalStaked: compactUSDorToken(iAeroMintedNum),
-    liqPrice:   isFinite(liqPrice)  ? liqPrice.toFixed(4)  : '0.0000',
-    aeroLocked: compactUSDorToken(aeroLockedNum),
-    aeroPrice:  isFinite(aeroPrice) ? aeroPrice.toFixed(4) : '0.0000',
-    iAeroPeg:   isFinite(iaeroPeg)  ? iaeroPeg.toFixed(4)  : '1.0000',
-    liqMinted:  compactUSDorToken(liqMintedNum)
+    liqPrice:    isFinite(liqPrice)  ? liqPrice.toFixed(4)  : '0.0000',
+    aeroLocked:  compactUSDorToken(aeroLockedNum),
+    aeroPrice:   isFinite(aeroPrice) ? aeroPrice.toFixed(4) : '0.0000',
+    iAeroPeg:    isFinite(iaeroPeg)  ? iaeroPeg.toFixed(4)  : '1.0000',
+    liqMinted:   compactUSDorToken(liqMintedNum)
   };
 }
 

@@ -722,8 +722,7 @@ Write in ${style} style specifically. Be creative and original.`;
       const resp = await openai.chat.completions.create({
         model: "gpt-5-mini",
         messages: [{ role: "user", content: prompt }],
-        max_completion_tokens: 100,
-        temperature: 0.95 + (attempt * 0.03), // Higher base temperature
+        max_completion_tokens: 500,
         presence_penalty: 0.7, // Penalize repetition more
         frequency_penalty: 0.7  // Encourage variety more
       });
@@ -846,8 +845,7 @@ ${style === 'wife_changing_money' ? 'Make a wife-changing wealth joke' : ''}`;
       const resp = await openai.chat.completions.create({
         model: "gpt-5-mini",
         messages: [{ role: "user", content: prompt }],
-        max_completion_tokens: 100,
-        temperature: 0.95 + (attempt * 0.03), // Even more creative for shitposts
+        max_completion_tokens: 500,
         presence_penalty: 0.5,
         frequency_penalty: 0.5
       });

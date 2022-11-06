@@ -1,0 +1,16 @@
+{
+  "name": "iaero-twitter-bot",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "start": "node twitter-bot.mjs",
+    "dev": "node --watch twitter-bot.mjs"
+  },
+  "dependencies": {
+    "twitter-api-v2": "^1.15.0",
+    "openai": "^4.0.0",
+    "node-cron": "^3.0.2",
+    "dotenv": "^16.0.3",
+    "express": "^4.18.2"
+  }
+}

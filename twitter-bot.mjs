@@ -147,22 +147,28 @@ async function getProtocolStats() {
       'function token1() view returns (address)'
     ];
     
-    const TOKEN_ABI = [
-      'function totalSupply() view returns (uint256)'
-    ];
-    
     // Initialize contracts
     const vault = new ethers.Contract(VAULT_ADDRESS, VAULT_ABI, provider);
     const liqPool = new ethers.Contract(LIQ_USDC_POOL, POOL_ABI, provider);
     const aeroPool = new ethers.Contract(USDC_AERO_POOL, POOL_ABI, provider);
     const iAeroPool = new ethers.Contract(IAERO_AERO_POOL, POOL_ABI, provider);
     
-    // Fetch all data in parallel
+    // Split into two batches to avoid the 10 call limit
+    // Batch 1: Vault data
     const [
       aeroLocked,
       liqMinted,
       iAeroMinted,
-      vaultStatus,
+      vaultStatus
+    ] = await Promise.all([
+      vault.totalAEROLocked(),
+      vault.totalLIQMinted(),
+      vault.totalIAEROMinted(),
+      vault.vaultStatus()
+    ]);
+    
+    // Batch 2: Pool data
+    const [
       liqReserves,
       liqToken0,
       liqToken1,
@@ -173,10 +179,6 @@ async function getProtocolStats() {
       iAeroToken0,
       iAeroToken1
     ] = await Promise.all([
-      vault.totalAEROLocked(),
-      vault.totalLIQMinted(),
-      vault.totalIAEROMinted(),
-      vault.vaultStatus(),
       liqPool.getReserves(),
       liqPool.token0(),
       liqPool.token1(),
@@ -192,18 +194,15 @@ async function getProtocolStats() {
     const liqIsToken0 = liqToken0.toLowerCase() !== BASE_USDC.toLowerCase();
     const liqReserve = liqIsToken0 ? liqReserves[0] : liqReserves[1];
     const usdcReserveLiq = liqIsToken0 ? liqReserves[1] : liqReserves[0];
-    // LIQ has 18 decimals, USDC has 6
     const liqPrice = Number(usdcReserveLiq) * 1e12 / Number(liqReserve);
     
     // Calculate AERO/USDC price
     const aeroIsToken0 = aeroToken0.toLowerCase() !== BASE_USDC.toLowerCase();
     const aeroReserve = aeroIsToken0 ? aeroReserves[0] : aeroReserves[1];
     const usdcReserveAero = aeroIsToken0 ? aeroReserves[1] : aeroReserves[0];
-    // AERO has 18 decimals, USDC has 6
     const aeroPrice = Number(usdcReserveAero) * 1e12 / Number(aeroReserve);
     
     // Calculate iAERO/AERO peg
-    // Both iAERO and AERO have 18 decimals
     const iAeroIsToken0 = iAeroToken0.toLowerCase() < iAeroToken1.toLowerCase();
     const iAeroReserve = iAeroIsToken0 ? iAeroReserves[0] : iAeroReserves[1];
     const aeroReserveInPair = iAeroIsToken0 ? iAeroReserves[1] : iAeroReserves[0];
@@ -214,12 +213,11 @@ async function getProtocolStats() {
     const liqMintedNum = Number(ethers.formatEther(liqMinted));
     const iAeroMintedNum = Number(ethers.formatEther(iAeroMinted));
     
-    // Calculate TVL (value of locked AERO in USD)
+    // Calculate TVL
     const tvl = aeroLockedNum * aeroPrice;
     
-    // Calculate APY (simplified - you might want to calculate from actual rewards)
-    // This is a placeholder - implement actual APY calculation based on your rewards
-    const apy = 30; 
+    // Calculate APY (placeholder - implement actual calculation)
+    const apy = 30;
     
     return {
       tvl: tvl > 1000000 ? `${(tvl / 1000000).toFixed(2)}M` : `${(tvl / 1000).toFixed(0)}K`,
@@ -234,15 +232,15 @@ async function getProtocolStats() {
     
   } catch (error) {
     console.error('Failed to fetch on-chain stats:', error);
-    // Return placeholder data for testing
+    // Return placeholder data
     return {
-      tvl: '5.2M',
+      tvl: '0.02M',
       apy: '30',
-      totalStaked: '1.8M',
+      totalStaked: '0.02M',
       liqPrice: '0.15',
-      aeroLocked: '2.5M',
-      aeroPrice: '1.50',
-      iAeroPeg: '1.00',
+      aeroLocked: '0.02M',
+      aeroPrice: '1.20',
+      iAeroPeg: '85%',
       liqMinted: '950K'
     };
   }

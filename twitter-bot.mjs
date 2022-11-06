@@ -45,7 +45,7 @@ const STRICT_ORIGINALITY = OPENAI_ENABLED && process.env.STRICT_ORIGINALITY === 
  *  - For GPT-5: uses max_completion_tokens; disallows temperature/penalties.
  *  - For legacy models (if ever used): can accept legacyTuning.
  */
-async function chatOnce({ prompt, max = 120, legacyTuning }) {
+async function chatOnce({ prompt, max = 500, legacyTuning }) {
   const base = { model: OPENAI_MODEL, messages: [{ role: 'user', content: prompt }] };
   if (isGpt5Family) {
     return openai.chat.completions.create({ ...base, max_completion_tokens: max });

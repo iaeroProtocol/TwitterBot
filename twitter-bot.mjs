@@ -612,9 +612,9 @@ async function isTwitterSimilar(newTweet, recentTweets, threshold = 0.35) {
 
 // ENHANCED: More thorough OpenAI check (optional based on env)
 async function checkWithOpenAI(newTweet, recentTweets) {
-  // Skip if not in strict mode
-  if (!STRICT_ORIGINALITY) return false;
-  
+  // Only run if strict mode AND OpenAI configured
+  if (!STRICT_ORIGINALITY || !OPENAI_ENABLED) return false;
+
   const prompt = `Analyze if this new tweet is too similar to recent tweets.
 
 New tweet:
@@ -637,21 +637,19 @@ The goal is to have diverse, interesting tweets that don't feel bot-generated.
 Respond with only "YES" if too similar/formulaic, or "NO" if sufficiently different and original.`;
 
   try {
-    if (!STRICT_ORIGINALITY) return false;
-
+    // Use the GPT-5-friendly wrapper you added earlier
     const resp = await chatOnce({ prompt, max: 10 });
-    // YES/NO:
-    const result = (resp.choices[0].message.content || '').trim().toUpperCase();
-    return result.includes('YES');
 
-    
-    const result = resp.choices[0].message.content.trim().toUpperCase();
-    return result.includes('YES');
+    const content = (resp?.choices?.[0]?.message?.content ?? '');
+    const verdict = content.trim().toUpperCase();
+
+    return verdict.includes('YES');
   } catch (error) {
     console.error('OpenAI similarity check failed:', error);
-    return false;
+    return false; // fail open (don’t block tweeting)
   }
 }
+
 
 /* ---------------- Tweet builders (COMPLETELY REWRITTEN) ---------------- */
 async function generateProtocolTweet(maxAttempts = 5) {

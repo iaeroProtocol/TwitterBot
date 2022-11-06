@@ -1,4 +1,4 @@
-    // twitter-bot.mjs — Production version with hash deduplication and improvements
+// twitter-bot.mjs — Production version with hash deduplication and improvements
 import 'dotenv/config';
 import { TwitterApi } from 'twitter-api-v2';
 import OpenAI from 'openai';
@@ -506,6 +506,8 @@ async function getRecentTweets(count = 20) {
     // Check if rate limited
     if (error?.code === 429 || error?.status === 429) {
       console.log('Rate limited by Twitter API, using cached tweets');
+      recentTweetsCache.timestamp = Date.now();
+      recentTweetsCache.ttl = 45 * 60 * 1000; // 45 min
     }
     return recentTweetsCache.tweets || []; // Return cached tweets if available
   }
@@ -603,7 +605,7 @@ Respond with only "YES" if too similar/formulaic, or "NO" if sufficiently differ
     const resp = await openai.chat.completions.create({
       model: "gpt-5-mini",
       messages: [{ role: "user", content: prompt }],
-      max_tokens: 10,
+      max_completion_tokens: 10,
       temperature: 0.3
     });
     
@@ -720,7 +722,7 @@ Write in ${style} style specifically. Be creative and original.`;
       const resp = await openai.chat.completions.create({
         model: "gpt-5-mini",
         messages: [{ role: "user", content: prompt }],
-        max_tokens: 100,
+        max_completion_tokens: 100,
         temperature: 0.95 + (attempt * 0.03), // Higher base temperature
         presence_penalty: 0.7, // Penalize repetition more
         frequency_penalty: 0.7  // Encourage variety more
@@ -844,7 +846,7 @@ ${style === 'wife_changing_money' ? 'Make a wife-changing wealth joke' : ''}`;
       const resp = await openai.chat.completions.create({
         model: "gpt-5-mini",
         messages: [{ role: "user", content: prompt }],
-        max_tokens: 100,
+        max_completion_tokens: 100,
         temperature: 0.95 + (attempt * 0.03), // Even more creative for shitposts
         presence_penalty: 0.5,
         frequency_penalty: 0.5
@@ -1017,8 +1019,9 @@ async function startBot() {
   if (testStats && testStats.tvl !== '0') {
     // Add small delay if we were rate limited
     if (!recentTweetsCache.tweets || recentTweetsCache.tweets.length === 0) {
-      console.log('Waiting 30s before first tweet due to rate limit...');
-      await new Promise(r => setTimeout(r, 30000));
+      const jitter = 5 + Math.floor(Math.random() * 10); // 5–15 minutes
+      console.log(`Rate limited; waiting ${jitter} minutes before first tweet...`);
+      await new Promise(r => setTimeout(r, jitter * 60 * 1000));
     }
     await postTweet();
   } else {

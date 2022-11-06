@@ -170,15 +170,20 @@ Requirements:
 - Include 1-2 hashtags`;
 
   try {
-    const response = await openai.chat.completions.create({
-      model: 'gpt-5',  // Use a valid model
-      messages: [{ role: 'user', content: prompt }],
-      max_completion_tokens: 400
+    const response = await openai.responses.create({
+      model: "gpt-5-mini",  // Using mini for cost optimization
+      input: prompt,
+      reasoning: { 
+        effort: "minimal"  // Fast response for simple tweet generation
+      },
+      text: { 
+        verbosity: "low"  // Keep tweets concise
+      }
     });
     
-    return response.choices[0].message.content;
+    return response.output_text;
   } catch (error) {
-    console.error('OpenAI error:', error);
+    console.error('GPT-5 API error:', error);
     // Fallback tweets
     const fallbacks = [
       `🚀 Lock AERO permanently, get 0.95 iAERO. Trade anytime while earning 80% of protocol fees. No unlock periods on Base. TVL: $${stats?.tvl}`,
@@ -212,16 +217,20 @@ Requirements:
 - Don't be overly promotional`;
 
   try {
-    const response = await openai.chat.completions.create({
-      model: 'gpt-5',  // Use a valid model
-      messages: [{ role: 'user', content: prompt }],
-      max_completion_tokens: 400
+    const response = await openai.responses.create({
+      model: "gpt-5-nano",  // Using nano for high-throughput simple tasks
+      input: prompt,
+      reasoning: { 
+        effort: "minimal"  // Shitposts don't need deep reasoning
+      },
+      text: { 
+        verbosity: "medium"  // Allow some creativity
+      }
     });
     
-    return response.choices[0].message.content;
+    return response.output_text;
   } catch (error) {
-    console.error('OpenAI error:', error);
-    // Fallback shitposts
+    console.error('GPT-5 API error:', error);
     const fallbacks = [
       "Watching people check their 4-year lock countdown every day while iAERO holders are out here liquid and vibing 😎 Some choose prison, we choose freedom ser",
       "Gas fees so high on mainnet, even the whales are migrating to Base 🐋 Good thing iAERO lives where transactions don't cost your firstborn",

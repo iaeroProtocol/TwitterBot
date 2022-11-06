@@ -615,7 +615,7 @@ Requirements:
 - Avoid generic promo`;
 
     try {
-      const resp = await chatOnce({ prompt, max: 120 });
+      const resp = await chatOnce({ prompt, max: 500 });
       const raw  = resp?.choices?.[0]?.message?.content ?? '';
       const generated = raw.trim();
       if (!generated) { console.warn('Empty OpenAI content; retrying…'); continue; }

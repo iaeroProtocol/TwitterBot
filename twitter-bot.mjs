@@ -189,7 +189,6 @@ Requirements:
     const response = await openai.chat.completions.create({
       model: 'gpt-5',
       messages: [{ role: 'user', content: prompt }],
-      temperature: 0.7,
       max_completion_tokens: 300
     });
     
@@ -234,7 +233,6 @@ Requirements:
     const response = await openai.chat.completions.create({
       model: 'gpt-4',
       messages: [{ role: 'user', content: prompt }],
-      temperature: 0.9,
       max_completion_tokens: 300
     });
     

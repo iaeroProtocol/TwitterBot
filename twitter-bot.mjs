@@ -39,8 +39,43 @@ const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const DEBUG_STATS = process.env.DEBUG_STATS === '1';
 const STRICT_ORIGINALITY = process.env.STRICT_ORIGINALITY === '1'; // Optional deep checks
 
+const OPENAI_ENABLED = !!process.env.OPENAI_API_KEY;
+const OPENAI_MODEL   = process.env.OPENAI_MODEL || 'gpt-5-mini';
+const isGpt5Family   = OPENAI_MODEL.startsWith('gpt-5');
+
+/**
+ * Uniform chat wrapper compatible with GPT-5 and older models.
+ * - For GPT-5: use max_completion_tokens, omit temperature/penalties.
+ * - For older models: you can pass legacy params if you want (example shown).
+ */
+async function chatOnce({ prompt, max = 100, legacyTuning }) {
+  const base = {
+    model: OPENAI_MODEL,
+    messages: [{ role: 'user', content: prompt }]
+  };
+
+  if (isGpt5Family) {
+    return openai.chat.completions.create({
+      ...base,
+      max_completion_tokens: max
+      // No temperature / penalties on GPT-5
+    });
+  } else {
+    // Optional legacy branch if you switch back to GPT-4-class models later
+    const { temperature = 0.9, presence_penalty = 0.6, frequency_penalty = 0.6 } = legacyTuning || {};
+    return openai.chat.completions.create({
+      ...base,
+      max_tokens: max,
+      temperature,
+      presence_penalty,
+      frequency_penalty
+    });
+  }
+}
+
+
 // Create a persistent provider instance
-const provider = new ethers.JsonRpcProvider(process.env.RPC_URL || 'https://mainnet.base.org');
+const provider = new ethers.JsonRpcProvider(process.env.RPC_URL || 'https://base-mainnet.g.alchemy.com/v2/OOO0w6ZDwoB2-08TOnNvN');
 
 // Cache for stats with TTL
 let statsCache = {
@@ -602,12 +637,13 @@ The goal is to have diverse, interesting tweets that don't feel bot-generated.
 Respond with only "YES" if too similar/formulaic, or "NO" if sufficiently different and original.`;
 
   try {
-    const resp = await openai.chat.completions.create({
-      model: "gpt-5-mini",
-      messages: [{ role: "user", content: prompt }],
-      max_completion_tokens: 10,
-      temperature: 0.3
-    });
+    if (!STRICT_ORIGINALITY) return false;
+
+    const resp = await chatOnce({ prompt, max: 10 });
+    // YES/NO:
+    const result = (resp.choices[0].message.content || '').trim().toUpperCase();
+    return result.includes('YES');
+
     
     const result = resp.choices[0].message.content.trim().toUpperCase();
     return result.includes('YES');
@@ -719,15 +755,10 @@ CRITICAL REQUIREMENTS:
 Write in ${style} style specifically. Be creative and original.`;
 
     try {
-      const resp = await openai.chat.completions.create({
-        model: "gpt-5-mini",
-        messages: [{ role: "user", content: prompt }],
-        max_completion_tokens: 500,
-        presence_penalty: 0.7, // Penalize repetition more
-        frequency_penalty: 0.7  // Encourage variety more
-      });
-      
+      const resp = await chatOnce({ prompt, max: 500 });
+      // Then:
       const generatedTweet = resp.choices[0].message.content.trim();
+
       
       // Check against hash history first
       const tweetHash = hashTweet(generatedTweet);
@@ -842,15 +873,10 @@ ${style === 'year_2028_joke' ? 'Make a joke about the year 2028 when locks expir
 ${style === 'wife_changing_money' ? 'Make a wife-changing wealth joke' : ''}`;
 
     try {
-      const resp = await openai.chat.completions.create({
-        model: "gpt-5-mini",
-        messages: [{ role: "user", content: prompt }],
-        max_completion_tokens: 500,
-        presence_penalty: 0.5,
-        frequency_penalty: 0.5
-      });
-      
-      const generatedTweet = resp.choices[0].message.content;
+      const resp = await chatOnce({ prompt, max: 500 });
+      // const generatedTweet = resp.choices[0].message.content.trim();
+      const generatedTweet = resp.choices[0].message.content; // you can trim if you like
+
       
       // Check hash
       const tweetHash = hashTweet(generatedTweet);

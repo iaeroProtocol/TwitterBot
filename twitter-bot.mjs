@@ -143,7 +143,7 @@ async function getProtocolStats() {
     // Return placeholder data for testing
     return {
       tvl: '5.2M',
-      apy: '42.5',
+      apy: '30',
       totalStaked: '1.8M',
       liqPrice: '0.15',
       aeroLocked: '2.5M'
@@ -187,7 +187,7 @@ Requirements:
 
   try {
     const response = await openai.chat.completions.create({
-      model: 'gpt-4',
+      model: 'gpt-5',
       messages: [{ role: 'user', content: prompt }],
       temperature: 0.7,
       max_tokens: 100

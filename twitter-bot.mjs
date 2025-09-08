@@ -173,7 +173,7 @@ Requirements:
     const response = await openai.chat.completions.create({
       model: 'gpt-5',  // Use a valid model
       messages: [{ role: 'user', content: prompt }],
-      max_tokens: 400
+      max_completion_tokens: 400
     });
     
     return response.choices[0].message.content;
@@ -215,7 +215,7 @@ Requirements:
     const response = await openai.chat.completions.create({
       model: 'gpt-5',  // Use a valid model
       messages: [{ role: 'user', content: prompt }],
-      max_tokens: 400
+      max_completion_tokens: 400
     });
     
     return response.choices[0].message.content;

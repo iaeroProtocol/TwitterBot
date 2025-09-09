@@ -4,6 +4,7 @@ import { TwitterApi } from 'twitter-api-v2';
 import OpenAI from 'openai';
 import cron from 'node-cron';
 import express from 'express';
+import { ethers } from 'ethers';
 
 // Health check server for Railway
 const app = express();
@@ -123,26 +124,126 @@ async function fetchGitBookContent() {
 // Stats fetcher from your API
 async function getProtocolStats() {
   try {
-    const response = await fetch('https://iaero.finance/api/stats');
-    if (!response.ok) throw new Error('Stats API error');
+    const provider = new ethers.JsonRpcProvider('https://mainnet.base.org');
     
-    const data = await response.json();
+    // Contract addresses
+    const VAULT_ADDRESS = '0x877398Aea8B5cCB0D482705c2D88dF768c953957';
+    const IAERO_AERO_POOL = '0x08d49DA370ecfFBC4c6Fdd2aE82B2D6aE238Affd';
+    const LIQ_USDC_POOL = '0x8966379fCD16F7cB6c6EA61077B6c4fAfECa28f4';
+    const USDC_AERO_POOL = '0x6cDcb1C4A4D1C3C6d054b27AC5B77e89eAFb971d';
+    const BASE_USDC = '0x833589fCD6EDb6E08f4c7C32D4f71b54bdA02913';
+    
+    // ABIs
+    const VAULT_ABI = [
+      'function totalAEROLocked() view returns (uint256)',
+      'function totalLIQMinted() view returns (uint256)',
+      'function totalIAEROMinted() view returns (uint256)',
+      'function vaultStatus() view returns (uint256,uint256,uint256,uint256,uint256,uint256,uint256,uint256,uint256,bool,bool)'
+    ];
+    
+    const POOL_ABI = [
+      'function getReserves() view returns (uint256,uint256,uint256)',
+      'function token0() view returns (address)',
+      'function token1() view returns (address)'
+    ];
+    
+    const TOKEN_ABI = [
+      'function totalSupply() view returns (uint256)'
+    ];
+    
+    // Initialize contracts
+    const vault = new ethers.Contract(VAULT_ADDRESS, VAULT_ABI, provider);
+    const liqPool = new ethers.Contract(LIQ_USDC_POOL, POOL_ABI, provider);
+    const aeroPool = new ethers.Contract(USDC_AERO_POOL, POOL_ABI, provider);
+    const iAeroPool = new ethers.Contract(IAERO_AERO_POOL, POOL_ABI, provider);
+    
+    // Fetch all data in parallel
+    const [
+      aeroLocked,
+      liqMinted,
+      iAeroMinted,
+      vaultStatus,
+      liqReserves,
+      liqToken0,
+      liqToken1,
+      aeroReserves,
+      aeroToken0,
+      aeroToken1,
+      iAeroReserves,
+      iAeroToken0,
+      iAeroToken1
+    ] = await Promise.all([
+      vault.totalAEROLocked(),
+      vault.totalLIQMinted(),
+      vault.totalIAEROMinted(),
+      vault.vaultStatus(),
+      liqPool.getReserves(),
+      liqPool.token0(),
+      liqPool.token1(),
+      aeroPool.getReserves(),
+      aeroPool.token0(),
+      aeroPool.token1(),
+      iAeroPool.getReserves(),
+      iAeroPool.token0(),
+      iAeroPool.token1()
+    ]);
+    
+    // Calculate LIQ/USDC price
+    const liqIsToken0 = liqToken0.toLowerCase() !== BASE_USDC.toLowerCase();
+    const liqReserve = liqIsToken0 ? liqReserves[0] : liqReserves[1];
+    const usdcReserveLiq = liqIsToken0 ? liqReserves[1] : liqReserves[0];
+    // LIQ has 18 decimals, USDC has 6
+    const liqPrice = Number(usdcReserveLiq) * 1e12 / Number(liqReserve);
+    
+    // Calculate AERO/USDC price
+    const aeroIsToken0 = aeroToken0.toLowerCase() !== BASE_USDC.toLowerCase();
+    const aeroReserve = aeroIsToken0 ? aeroReserves[0] : aeroReserves[1];
+    const usdcReserveAero = aeroIsToken0 ? aeroReserves[1] : aeroReserves[0];
+    // AERO has 18 decimals, USDC has 6
+    const aeroPrice = Number(usdcReserveAero) * 1e12 / Number(aeroReserve);
+    
+    // Calculate iAERO/AERO peg
+    // Both iAERO and AERO have 18 decimals
+    const iAeroIsToken0 = iAeroToken0.toLowerCase() < iAeroToken1.toLowerCase();
+    const iAeroReserve = iAeroIsToken0 ? iAeroReserves[0] : iAeroReserves[1];
+    const aeroReserveInPair = iAeroIsToken0 ? iAeroReserves[1] : iAeroReserves[0];
+    const peg = Number(aeroReserveInPair) / Number(iAeroReserve);
+    
+    // Format values
+    const aeroLockedNum = Number(ethers.formatEther(aeroLocked));
+    const liqMintedNum = Number(ethers.formatEther(liqMinted));
+    const iAeroMintedNum = Number(ethers.formatEther(iAeroMinted));
+    
+    // Calculate TVL (value of locked AERO in USD)
+    const tvl = aeroLockedNum * aeroPrice;
+    
+    // Calculate APY (simplified - you might want to calculate from actual rewards)
+    // This is a placeholder - implement actual APY calculation based on your rewards
+    const apy = 30; 
+    
     return {
-      tvl: data.tvl || 'N/A',
-      apy: data.apy || 'N/A',
-      totalStaked: data.totalStaked || 'N/A',
-      liqPrice: data.liqPrice || 'N/A',
-      aeroLocked: data.aeroLocked || 'N/A'
+      tvl: tvl > 1000000 ? `${(tvl / 1000000).toFixed(2)}M` : `${(tvl / 1000).toFixed(0)}K`,
+      apy: apy.toString(),
+      totalStaked: iAeroMintedNum > 1000000 ? `${(iAeroMintedNum / 1000000).toFixed(2)}M` : `${(iAeroMintedNum / 1000).toFixed(0)}K`,
+      liqPrice: liqPrice.toFixed(4),
+      aeroLocked: aeroLockedNum > 1000000 ? `${(aeroLockedNum / 1000000).toFixed(2)}M` : `${(aeroLockedNum / 1000).toFixed(0)}K`,
+      aeroPrice: aeroPrice.toFixed(4),
+      iAeroPeg: peg.toFixed(4),
+      liqMinted: liqMintedNum > 1000000 ? `${(liqMintedNum / 1000000).toFixed(2)}M` : `${(liqMintedNum / 1000).toFixed(0)}K`
     };
+    
   } catch (error) {
-    console.error('Failed to fetch stats:', error);
+    console.error('Failed to fetch on-chain stats:', error);
     // Return placeholder data for testing
     return {
       tvl: '5.2M',
-      apy: '30.',
+      apy: '30',
       totalStaked: '1.8M',
       liqPrice: '0.15',
-      aeroLocked: '2.5M'
+      aeroLocked: '2.5M',
+      aeroPrice: '1.50',
+      iAeroPeg: '1.00',
+      liqMinted: '950K'
     };
   }
 }
@@ -319,15 +420,18 @@ async function startBot() {
     
     if (stats) {
       const statsTweet = `📊 iAERO Daily Stats Update
+        💰 TVL: $${stats.tvl}
+        📈 APY: ${stats.apy}%
+        🔒 AERO Locked: ${stats.aeroLocked}
+        💎 iAERO Minted: ${stats.totalStaked}
+        🪙 LIQ Minted: ${stats.liqMinted}
 
-💰 TVL: $${stats.tvl}
-📈 APY: ${stats.apy}%
-🔒 Total Staked: ${stats.totalStaked} iAERO
-💎 LIQ Price: $${stats.liqPrice}
-🏦 AERO Locked: ${stats.aeroLocked}
+        Prices:
+        - AERO: $${stats.aeroPrice}
+        - LIQ: $${stats.liqPrice}
+        - iAERO Peg: ${stats.iAeroPeg}x
 
-Stakers earn ${docs.stats.stakerShare} of all protocol fees.
-Lock. Stake. Earn. Stay liquid.`;
+        Lock. Stake. Earn. Stay liquid.`;
       
       try {
         await twitterClient.v2.tweet(statsTweet);

@@ -1,4 +1,4 @@
-// twitter-bot.mjs — Fixed version with proper syntax
+// twitter-bot.mjs - Clean version
 import 'dotenv/config';
 import { TwitterApi } from 'twitter-api-v2';
 import OpenAI from 'openai';
@@ -6,7 +6,7 @@ import cron from 'node-cron';
 import express from 'express';
 import { ethers } from 'ethers';
 
-/* ---------------- Health check (Railway) ---------------- */
+// Health check (Railway)
 const app = express();
 const PORT = process.env.PORT || 3001;
 
@@ -18,7 +18,7 @@ app.listen(PORT, () => {
   console.log(`Health check server running on port ${PORT}`);
 });
 
-/* ---------------- Clients ---------------- */
+// Clients
 const twitterClient = new TwitterApi({
   appKey: process.env.TWITTER_API_KEY,
   appSecret: process.env.TWITTER_API_SECRET,
@@ -30,11 +30,467 @@ const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 const DEBUG_STATS = process.env.DEBUG_STATS === '1';
 
-/* ---------------- Topics ---------------- */
+// Topics
 const PROTOCOL_TOPICS = [
   "How iAERO's liquid staking works",
   "Benefits of permanent AERO locking vs 4-year locks",
   "LIQ token emissions and halving schedule",
+  "Using stiAERO as collateral for borrowing",
+  "Protocol security and audit results",
+  "Yield optimization with iAERO staking",
+  "veAERO voting power and bribes",
+  "Protocol fee distribution model",
+  "iAERO/AERO peg stability mechanics",
+  "Staking rewards and current APR"
+];
+
+const SHITPOST_TOPICS = [
+  "Market volatility",
+  "DeFi yields",
+  "Airdrop farming",
+  "Gas fees",
+  "Crypto Twitter drama",
+  "Bull/bear market memes",
+  "Liquidity mining",
+  "Protocol wars on Base",
+  "Whale movements",
+  "CEX vs DEX debate"
+];
+
+// Minimal ABIs
+const ERC20_DECIMALS_ABI = ['function decimals() view returns (uint8)'];
+const PAIR_ABI = [
+  'function getReserves() view returns (uint256,uint256,uint256)',
+  'function token0() view returns (address)',
+  'function token1() view returns (address)'
+];
+
+// Helpers
+function compactUSDorToken(n) {
+  if (!isFinite(n) || n <= 0) return '0';
+  if (n >= 1_000_000) return (n / 1_000_000).toFixed(2) + 'M';
+  if (n >= 1_000) return (n / 1_000).toFixed(0) + 'K';
+  return n.toFixed(0);
+}
+
+async function readPair(provider, pairAddr) {
+  const pair = new ethers.Contract(pairAddr, PAIR_ABI, provider);
+  const token0 = await pair.token0();
+  const token1 = await pair.token1();
+  const reserves = await pair.getReserves();
+  const reserve0 = reserves[0];
+  const reserve1 = reserves[1];
+  return { token0, token1, reserve0, reserve1 };
+}
+
+async function resolveCoreTokens(provider, cfg) {
+  const usdcCk = ethers.getAddress(cfg.USDC);
+
+  const aeroPair = await readPair(provider, cfg.AERO_USDC_POOL);
+  const AERO = (aeroPair.token0.toLowerCase() === usdcCk.toLowerCase())
+    ? aeroPair.token1
+    : aeroPair.token0;
+
+  const liqPair = await readPair(provider, cfg.LIQ_USDC_POOL);
+  const LIQ = (liqPair.token0.toLowerCase() === usdcCk.toLowerCase())
+    ? liqPair.token1
+    : liqPair.token0;
+
+  const iaeroPair = await readPair(provider, cfg.IAERO_AERO_POOL);
+  const IAERO = (iaeroPair.token0.toLowerCase() === AERO.toLowerCase())
+    ? iaeroPair.token1
+    : iaeroPair.token0;
+
+  const decMap = new Map();
+  async function putDecimals(addr) {
+    try {
+      const ck = ethers.getAddress(addr);
+      const c = new ethers.Contract(ck, ERC20_DECIMALS_ABI, provider);
+      const d = await c.decimals();
+      decMap.set(ck.toLowerCase(), Number(d));
+    } catch (e) {
+      decMap.set(addr.toLowerCase(), 18);
+      if (DEBUG_STATS) console.warn('decimals() failed for', addr, '— defaulting to 18');
+    }
+  }
+  
+  await Promise.all([AERO, LIQ, IAERO, usdcCk].map(putDecimals));
+
+  if (DEBUG_STATS) {
+    console.log('[DEBUG] Tokens:', { AERO, LIQ, IAERO, USDC: usdcCk });
+    console.log('[DEBUG] Decimals:', Object.fromEntries(decMap.entries()));
+  }
+
+  return { tokens: { AERO, LIQ, IAERO, USDC: usdcCk }, decimals: decMap };
+}
+
+async function pairPrice(provider, pairAddr, baseAddr, quoteAddr, decMap) {
+  const info = await readPair(provider, pairAddr);
+
+  const baseLC = baseAddr.toLowerCase();
+  const quoteLC = quoteAddr.toLowerCase();
+  const t0LC = info.token0.toLowerCase();
+  const t1LC = info.token1.toLowerCase();
+
+  if (baseLC !== t0LC && baseLC !== t1LC) throw new Error('base not in pair');
+  if (quoteLC !== t0LC && quoteLC !== t1LC) throw new Error('quote not in pair');
+
+  const baseReserve = (baseLC === t0LC) ? info.reserve0 : info.reserve1;
+  const quoteReserve = (quoteLC === t0LC) ? info.reserve0 : info.reserve1;
+
+  const baseDec = decMap.get(baseLC) ?? 18;
+  const quoteDec = decMap.get(quoteLC) ?? 18;
+
+  const baseFloat = parseFloat(ethers.formatUnits(baseReserve, baseDec));
+  const quoteFloat = parseFloat(ethers.formatUnits(quoteReserve, quoteDec));
+  if (baseFloat === 0) throw new Error('zero base reserve');
+  return quoteFloat / baseFloat;
+}
+
+// Docs context
+function getDocumentationContext() {
+  return {
+    keyFacts: [
+      "iAERO is a liquid staking protocol on Base network",
+      "Users lock AERO permanently and receive liquid iAERO tokens at 0.95:1 ratio",
+      "5% protocol fee means you get 0.95 iAERO for every 1 AERO deposited",
+      "iAERO can be traded on DEXs while earning staking rewards",
+      "Stakers of iAERO earn 80% of all protocol fees",
+      "Protocol treasury receives 20% of fees",
+      "LIQ token has a halving emission schedule every 5M tokens",
+      "stiAERO (staked iAERO) can be used as collateral for borrowing",
+      "Protocol owns permanently locked veAERO NFTs",
+      "5% protocol fee on all AERO deposits",
+      "No unlock period - iAERO is always liquid and tradeable",
+      "iAERO maintains peg through arbitrage opportunities",
+      "Staking rewards are distributed weekly after epoch ends",
+      "Protocol is non-custodial and immutable"
+    ],
+    stats: {
+      protocolFee: "5%",
+      stakerShare: "80%",
+      treasuryShare: "20%",
+      liqEmissionModel: "halving per 5M tokens",
+      stakingLockPeriod: "7 days for LIQ unstaking",
+      conversionRatio: "0.95 iAERO per 1 AERO"
+    }
+  };
+}
+
+async function fetchGitBookContent() {
+  const baseUrl = 'https://docs.iaero.finance';
+  const pages = [
+    '/introduction/what-is-iaero',
+    '/getting-started/key-concepts-and-how-to',
+    '/getting-started/what-is-stiaero',
+    '/getting-started/the-magic-of-iaero',
+    '/tokenomics/iaero-token',
+    '/tokenomics/liq-token'
+  ];
+
+  try {
+    console.log('Fetching GitBook documentation...');
+    const texts = [];
+    for (const page of pages) {
+      const resp = await fetch(`${baseUrl}${page}`);
+      if (!resp.ok) continue;
+      const html = await resp.text();
+      const text = html
+        .replace(/<[^>]*>/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim()
+        .slice(0, 2000);
+      if (text) texts.push(text);
+    }
+    return texts.join('\n\n');
+  } catch (err) {
+    console.error('Failed to fetch GitBook:', err);
+    return null;
+  }
+}
+
+// On-chain stats
+async function getProtocolStats() {
+  const provider = new ethers.JsonRpcProvider(process.env.RPC_URL || 'https://mainnet.base.org');
+
+  const VAULT_ADDRESS = process.env.VAULT_ADDRESS || '0x877398Aea8B5cCB0D482705c2D88dF768c953957';
+  const IAERO_AERO_POOL = process.env.IAERO_AERO_POOL || '0x08d49DA370ecfFBC4c6Fdd2aE82B2D6aE238Affd';
+  const LIQ_USDC_POOL = process.env.LIQ_USDC_POOL || '0x8966379fCD16F7cB6c6EA61077B6c4fAfECa28f4';
+  const AERO_USDC_POOL = process.env.AERO_USDC_POOL || '0x6cDcb1C4A4D1C3C6d054b27AC5B77e89eAFb971d';
+  const USDC_ADDRESS = process.env.USDC_ADDRESS || '0x833589fCD6EDb6E08f4c7C32D4f71b54bdA02913';
+
+  const VAULT_ABI = [
+    'function totalAEROLocked() view returns (uint256)',
+    'function totalLIQMinted() view returns (uint256)',
+    'function totalIAEROMinted() view returns (uint256)',
+    'function vaultStatus() view returns (uint256,uint256,uint256,uint256,uint256,uint256,uint256,uint256,uint256,bool,bool)',
+    'function getTotalValueLocked() view returns (uint256)'
+  ];
+
+  const vault = new ethers.Contract(VAULT_ADDRESS, VAULT_ABI, provider);
+
+  let aeroLockedNum = 0;
+  let liqMintedNum = 0;
+  let iAeroMintedNum = 0;
+  let aeroPrice = NaN;
+  let liqPrice = NaN;
+  let iaeroPeg = NaN;
+
+  // Read vault metrics
+  try {
+    const totalAEROLocked = await vault.totalAEROLocked();
+    aeroLockedNum = parseFloat(ethers.formatEther(totalAEROLocked));
+    console.log('✓ AERO locked:', aeroLockedNum);
+  } catch (e) {
+    console.error('totalAEROLocked() failed:', e?.message || e);
+    try {
+      const tvl = await vault.getTotalValueLocked();
+      aeroLockedNum = parseFloat(ethers.formatEther(tvl));
+      console.log('✓ AERO locked (fallback):', aeroLockedNum);
+    } catch (e2) {
+      console.error('getTotalValueLocked() failed:', e2?.message || e2);
+    }
+  }
+
+  try {
+    const totalLIQMinted = await vault.totalLIQMinted();
+    liqMintedNum = parseFloat(ethers.formatEther(totalLIQMinted));
+    console.log('✓ LIQ minted:', liqMintedNum);
+  } catch (e) {
+    console.error('totalLIQMinted() failed:', e?.message || e);
+  }
+
+  try {
+    const totalIAEROMinted = await vault.totalIAEROMinted();
+    iAeroMintedNum = parseFloat(ethers.formatEther(totalIAEROMinted));
+    console.log('✓ iAERO minted:', iAeroMintedNum);
+  } catch (e) {
+    console.error('totalIAEROMinted() failed:', e?.message || e);
+  }
+
+  // Get prices
+  try {
+    const { tokens, decimals } = await resolveCoreTokens(provider, {
+      AERO_USDC_POOL, LIQ_USDC_POOL, IAERO_AERO_POOL, USDC: USDC_ADDRESS
+    });
+
+    try {
+      aeroPrice = await pairPrice(provider, AERO_USDC_POOL, tokens.AERO, tokens.USDC, decimals);
+      console.log('✓ AERO price:', aeroPrice);
+    } catch (e) {
+      console.error('AERO price failed:', e?.message || e);
+    }
+
+    try {
+      liqPrice = await pairPrice(provider, LIQ_USDC_POOL, tokens.LIQ, tokens.USDC, decimals);
+      console.log('✓ LIQ price:', liqPrice);
+    } catch (e) {
+      console.error('LIQ price failed:', e?.message || e);
+    }
+
+    try {
+      iaeroPeg = await pairPrice(provider, IAERO_AERO_POOL, tokens.IAERO, tokens.AERO, decimals);
+      console.log('✓ iAERO peg:', iaeroPeg);
+    } catch (e) {
+      console.error('iAERO peg failed:', e?.message || e);
+    }
+  } catch (e) {
+    console.error('Token resolution failed:', e?.message || e);
+  }
+
+  const tvlFloat = (isFinite(aeroPrice) && aeroLockedNum > 0) ? aeroLockedNum * aeroPrice : 0;
+
+  console.log('=== STATS ===');
+  console.log('TVL:', tvlFloat);
+  console.log('=============');
+
+  return {
+    tvl: compactUSDorToken(tvlFloat),
+    apy: '30',
+    totalStaked: compactUSDorToken(iAeroMintedNum),
+    liqPrice: isFinite(liqPrice) ? liqPrice.toFixed(4) : '0.0000',
+    aeroLocked: compactUSDorToken(aeroLockedNum),
+    aeroPrice: isFinite(aeroPrice) ? aeroPrice.toFixed(4) : '0.0000',
+    iAeroPeg: isFinite(iaeroPeg) ? iaeroPeg.toFixed(4) : '1.0000',
+    liqMinted: compactUSDorToken(liqMintedNum)
+  };
+}
+
+// Tweet builders
+async function generateProtocolTweet() {
+  const topic = PROTOCOL_TOPICS[Math.floor(Math.random() * PROTOCOL_TOPICS.length)];
+  const stats = await getProtocolStats();
+
+  const gitbookContent = await fetchGitBookContent();
+  const docsContext = gitbookContent || getDocumentationContext().keyFacts.join('\n');
+
+  const prompt = `Based on this documentation about iAERO Protocol:
+${docsContext}
+
+Create a tweet about: ${topic}
+
+Current stats: TVL $${stats?.tvl}, APY ${stats?.apy}%
+
+Requirements:
+- Under 280 characters
+- Factually accurate based on the docs
+- Include 1-2 emojis
+- Include 1-2 hashtags`;
+
+  try {
+    const resp = await openai.chat.completions.create({
+      model: "gpt-4o-mini",
+      messages: [{ role: "user", content: prompt }],
+      max_tokens: 100,
+      temperature: 0.8
+    });
+    return resp.choices[0].message.content;
+  } catch (error) {
+    console.error('OpenAI error:', error);
+    const fallbacks = [
+      `🚀 Lock AERO permanently, get 0.95 iAERO. Trade anytime while earning 80% of protocol fees. TVL: $${stats?.tvl}`,
+      `💎 iAERO: Permanent lock, liquid token. Earn 80% protocol fees + LIQ rewards. ${stats?.apy}% APY`,
+      `📊 Why lock for 4 years? iAERO gives permanent lock + liquid tokens. DeFi evolved.`
+    ];
+    return fallbacks[Math.floor(Math.random() * fallbacks.length)];
+  }
+}
+
+async function generateShitpost() {
+  const topic = SHITPOST_TOPICS[Math.floor(Math.random() * SHITPOST_TOPICS.length)];
+
+  const prompt = `Create a witty, crypto-native tweet about ${topic}.
+
+Context about iAERO (use subtly if relevant):
+- Permanent locks with liquid tokens
+- No unlock periods unlike traditional ve(3,3)
+- On Base network with low fees
+- 80% protocol fee distribution
+
+Requirements:
+- Be funny and relatable to crypto Twitter
+- Use crypto slang naturally
+- Keep under 280 characters
+- Use emojis
+- Max 1 hashtag`;
+
+  try {
+    const resp = await openai.chat.completions.create({
+      model: "gpt-4o-mini",
+      messages: [{ role: "user", content: prompt }],
+      max_tokens: 100,
+      temperature: 0.9
+    });
+    return resp.choices[0].message.content;
+  } catch (error) {
+    console.error('OpenAI error:', error);
+    const fallbacks = [
+      "Watching people check their 4-year lock countdown while iAERO holders are liquid and vibing 😎",
+      "Gas fees so high on mainnet, even the whales are migrating to Base 🐋",
+      "POV: You're explaining why your AERO is locked until 2028 while the iAERO chad is compounding daily 🗿",
+      "gm to everyone except those still doing 4 year locks in 2025 💀",
+      "Imagine locking tokens and NOT being able to rage quit. Couldn't be iAERO holders 🤝"
+    ];
+    return fallbacks[Math.floor(Math.random() * fallbacks.length)];
+  }
+}
+
+// Posting
+async function postTweet() {
+  try {
+    const isProtocolTweet = Math.random() < 0.75;
+    let tweetContent = isProtocolTweet ? await generateProtocolTweet() : await generateShitpost();
+
+    console.log(`[${new Date().toISOString()}] Posting:`, tweetContent);
+
+    if (tweetContent && tweetContent.length > 280) {
+      tweetContent = tweetContent.slice(0, 277) + '...';
+    }
+    
+    if (!tweetContent) {
+      console.error('No tweet content');
+      return;
+    }
+
+    const tweet = await twitterClient.v2.tweet(tweetContent);
+    console.log('Tweet posted:', tweet.data.id);
+    return tweet;
+  } catch (error) {
+    console.error('Failed to post:', error);
+  }
+}
+
+function getRandomIntervalMinutes() {
+  return Math.floor(Math.random() * 121 + 240); // 4-6 hours
+}
+
+function scheduleNextTweet() {
+  const minutes = getRandomIntervalMinutes();
+  const ms = minutes * 60 * 1000;
+  console.log(`Next tweet in ${minutes} minutes (${(minutes / 60).toFixed(1)} hours)`);
+
+  setTimeout(async () => {
+    await postTweet();
+    scheduleNextTweet();
+  }, ms);
+}
+
+// Main
+async function startBot() {
+  console.log('🤖 iAERO Twitter Bot starting...');
+  console.log('Config:', {
+    hasTwitterCreds: !!process.env.TWITTER_API_KEY,
+    hasOpenAI: !!process.env.OPENAI_API_KEY,
+    vaultAddress: process.env.VAULT_ADDRESS || '0x877398Aea8B5cCB0D482705c2D88dF768c953957'
+  });
+
+  const testStats = await getProtocolStats();
+  console.log('Stats:', testStats);
+
+  await postTweet();
+  scheduleNextTweet();
+
+  // Daily stats tweet
+  cron.schedule('0 14 * * *', async () => {
+    console.log('Daily stats tweet...');
+    const stats = await getProtocolStats();
+    if (stats) {
+      const msg = [
+        '📊 iAERO Daily Stats',
+        `💰 TVL: $${stats.tvl}`,
+        `📈 APY: ${stats.apy}%`,
+        `🔒 AERO Locked: ${stats.aeroLocked}`,
+        `💎 iAERO Minted: ${stats.totalStaked}`,
+        `🪙 LIQ Minted: ${stats.liqMinted}`,
+        '',
+        'Prices:',
+        `- AERO: $${stats.aeroPrice}`,
+        `- LIQ: $${stats.liqPrice}`,
+        `- iAERO Peg: ${stats.iAeroPeg}x`,
+        '',
+        'Lock. Stake. Earn. Stay liquid.'
+      ].join('\n');
+
+      try {
+        await twitterClient.v2.tweet(msg);
+        console.log('Daily stats posted');
+      } catch (error) {
+        console.error('Daily stats failed:', error);
+      }
+    }
+  });
+}
+
+process.on('unhandledRejection', (err) => {
+  console.error('Unhandled rejection:', err);
+});
+
+process.on('SIGTERM', () => {
+  console.log('SIGTERM received');
+  process.exit(0);
+});
+
+startBot();  "LIQ token emissions and halving schedule",
   "Using stiAERO as collateral for borrowing",
   "Protocol security and audit results",
   "Yield optimization with iAERO staking",

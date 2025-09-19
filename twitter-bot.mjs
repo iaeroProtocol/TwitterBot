@@ -249,13 +249,16 @@ async function getProtocolStats(forceRefresh = false) {
   let iaeroPeg  = NaN;
 
   /* -------- Read vault metrics with retry logic -------- */
-  const retryCall = async (fn, fallback = 0) => {
-    for (let i = 0; i < 3; i++) {
+  const retryCall = async (fn, fallback = 0, maxRetries = 5) => {
+    for (let i = 0; i < maxRetries; i++) {
       try {
         return await fn();
       } catch (e) {
-        console.error(`Attempt ${i + 1} failed:`, e?.message || e);
-        if (i < 2) await new Promise(r => setTimeout(r, 1000)); // wait 1s before retry
+        console.error(`Attempt ${i + 1}/${maxRetries} failed:`, e?.message || e);
+        if (i < maxRetries - 1) {
+          const delay = Math.min(1000 * Math.pow(2, i), 5000); // Exponential backoff, max 5s
+          await new Promise(r => setTimeout(r, delay));
+        }
       }
     }
     return fallback;
@@ -360,7 +363,7 @@ async function getProtocolStats(forceRefresh = false) {
 let recentTweetsCache = {
   tweets: [],
   timestamp: 0,
-  ttl: 10 * 60 * 1000 // 10 minute cache
+  ttl: 30 * 60 * 1000 // 30 minute cache (increased from 10)
 };
 
 async function getRecentTweets(count = 20) {
@@ -375,16 +378,21 @@ async function getRecentTweets(count = 20) {
     console.log(`Fetching last ${count} tweets...`);
     
     // Get the authenticated user's ID with retry logic
-    let me, userId;
-    try {
-      me = await twitterClient.v2.me();
-      userId = me.data.id;
-    } catch (meError) {
-      console.error('Failed to get user ID:', meError);
-      // Try to use a hardcoded user ID if available
-      userId = process.env.TWITTER_USER_ID;
-      if (!userId) {
-        console.error('No TWITTER_USER_ID env variable set as fallback');
+    let userId = process.env.TWITTER_USER_ID; // Try env var first
+    
+    if (!userId) {
+      try {
+        const me = await twitterClient.v2.me();
+        userId = me.data.id;
+        console.log('Got Twitter user ID:', userId);
+      } catch (meError) {
+        console.error('Failed to get user ID:', meError?.message || meError);
+        // If rate limited, just return empty array for now
+        if (meError?.code === 429 || meError?.status === 429) {
+          console.log('Rate limited on getting user ID, will retry later');
+          // Don't update cache timestamp so we retry next time
+          return recentTweetsCache.tweets || [];
+        }
         return recentTweetsCache.tweets || [];
       }
     }
@@ -588,11 +596,23 @@ Requirements:
   // Try to find a fallback that's not too similar
   for (const fallback of fallbacks.sort(() => Math.random() - 0.5)) {
     if (!await isTwitterSimilar(fallback, recentTweets, 0.5)) {
+      console.log('Using fallback tweet after generation failed');
       return fallback;
     }
   }
   
-  return fallbacks[0]; // Last resort
+  // Ultimate fallback: create a simple stats tweet that's always unique
+  console.warn('All fallbacks too similar, generating basic stats tweet');
+  const currentTime = new Date().toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: true });
+  const randomEmoji = ['🚀', '💎', '🔥', '⚡', '🌊'][Math.floor(Math.random() * 5)];
+  
+  if (stats && stats.tvl !== '0') {
+    return `${randomEmoji} iAERO Protocol Update at ${currentTime}: TVL ${stats.tvl} | APY ${stats.apy}% | Trade liquid while earning max rewards on Base. No 4-year locks needed.`;
+  }
+  
+  // Absolutely last resort - skip this tweet
+  console.error('Cannot generate unique tweet, returning null to skip');
+  return null;
 }
 
 async function generateShitpost(maxAttempts = 3) {
@@ -670,11 +690,30 @@ Requirements:
   // Try to find a diverse fallback
   for (const fallback of fallbacks.sort(() => Math.random() - 0.5)) {
     if (!await isTwitterSimilar(fallback, recentTweets, 0.4)) {
+      console.log('Using fallback shitpost after generation failed');
       return fallback;
     }
   }
   
-  return fallbacks[Math.floor(Math.random() * fallbacks.length)];
+  // Ultimate fallback: create a time-based unique shitpost
+  console.warn('All shitpost fallbacks too similar, generating time-based post');
+  const hour = new Date().getHours();
+  const timeBasedPosts = [
+    `gm (it's ${hour > 12 ? hour - 12 : hour}${hour >= 12 ? 'pm' : 'am'} somewhere and my AERO is still liquid while yours is locked) 🌅`,
+    `Hour ${hour}/24 of reminding you that permanent locks > 4 year jail sentences 🔓`,
+    `Daily reminder #${Math.floor(Math.random() * 999)}: iAERO exists and you're still doing 4-year locks for some reason 🤔`,
+    `Breaking at ${hour}:00 - Local DeFi user discovers tokens can be permanently locked AND liquid. More at never because it's iAERO 📰`
+  ];
+  
+  const selected = timeBasedPosts[Math.floor(Math.random() * timeBasedPosts.length)];
+  
+  // Check if even this is too similar
+  if (await isTwitterSimilar(selected, recentTweets, 0.3)) {
+    console.error('Even time-based post too similar, skipping shitpost');
+    return null;
+  }
+  
+  return selected;
 }
 
 /* ---------------- Posting loop ---------------- */
@@ -750,10 +789,16 @@ async function startBot() {
     await getRecentTweets();
   } catch (error) {
     console.error('Could not load tweet history on startup:', error?.message);
+    console.log('Bot will continue without tweet history for now');
   }
 
   // First tweet on startup (only if we have valid stats)
   if (testStats && testStats.tvl !== '0') {
+    // Add small delay if we were rate limited
+    if (recentTweetsCache.tweets.length === 0) {
+      console.log('Waiting 30s before first tweet due to rate limit...');
+      await new Promise(r => setTimeout(r, 30000));
+    }
     await postTweet();
   } else {
     console.log('Skipping initial tweet due to invalid stats');

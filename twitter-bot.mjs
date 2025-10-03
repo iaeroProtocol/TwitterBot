@@ -54,11 +54,11 @@ async function chatOnce({ prompt, max = 220, legacyTuning }) {
   const legacy = legacyTuning || { temperature: 0.9, presence_penalty: 0.6, frequency_penalty: 0.6 };
 
   if (isGpt5Family) {
-    return openai.chat.completions.create({ ...base, max_tokens: max });
+    return openai.chat.completions.create({ ...base, max_completion_tokens: max });
   }
   return openai.chat.completions.create({
     ...base,
-    max_tokens: max,
+    max_completion_tokens: max,
     temperature: legacy.temperature,
     presence_penalty: legacy.presence_penalty,
     frequency_penalty: legacy.frequency_penalty

@@ -1,4 +1,4 @@
-// twitter-bot.mjs — Production version with GPT-5 wrapper, hash dedupe, and robustness
+// twitter-bot.mjs — Production version with GPT-5 wrapper, rate-limit-safe timeline, 403-aware dedupe
 import 'dotenv/config';
 import { TwitterApi } from 'twitter-api-v2';
 import OpenAI from 'openai';
@@ -39,24 +39,41 @@ const OPENAI_MODEL       = process.env.OPENAI_MODEL || 'gpt-5-mini';
 const isGpt5Family       = OPENAI_MODEL.startsWith('gpt-5');
 const STRICT_ORIGINALITY = OPENAI_ENABLED && process.env.STRICT_ORIGINALITY === '1';
 
-// ---------- OpenAI (GPT-5 safe) wrapper ----------
+// ---------- OpenAI wrapper (fix: use max_tokens and robust extraction) ----------
+function extractOpenAIText(resp) {
+  // Try the standard string first
+  const msg = resp?.choices?.[0]?.message;
+  if (!msg) return '';
+  if (typeof msg.content === 'string') return msg.content;
+  // Some SDKs return content as an array of segments
+  if (Array.isArray(msg.content)) {
+    return msg.content.map(part => {
+      if (typeof part === 'string') return part;
+      if (typeof part?.text === 'string') return part.text;
+      return '';
+    }).join('');
+  }
+  return '';
+}
+
 /**
- * chatOnce:
- *  - For GPT-5: uses max_completion_tokens; disallows temperature/penalties.
- *  - For legacy models (if ever used): can accept legacyTuning.
+ * chatOnce: returns the full response (to keep call sites simple),
+ * but we ALWAYS set max_tokens and rely on extractOpenAIText for content.
  */
 async function chatOnce({ prompt, max = 500, legacyTuning }) {
   const base = { model: OPENAI_MODEL, messages: [{ role: 'user', content: prompt }] };
+  const legacy = legacyTuning || { temperature: 0.9, presence_penalty: 0.6, frequency_penalty: 0.6 };
+
   if (isGpt5Family) {
-    return openai.chat.completions.create({ ...base, max_completion_tokens: max });
+    // IMPORTANT: chat.completions expects max_tokens
+    return openai.chat.completions.create({ ...base, max_tokens: max });
   }
-  const { temperature = 0.9, presence_penalty = 0.6, frequency_penalty = 0.6 } = legacyTuning || {};
   return openai.chat.completions.create({
     ...base,
     max_tokens: max,
-    temperature,
-    presence_penalty,
-    frequency_penalty
+    temperature: legacy.temperature,
+    presence_penalty: legacy.presence_penalty,
+    frequency_penalty: legacy.frequency_penalty
   });
 }
 
@@ -348,11 +365,11 @@ async function getProtocolStats(forceRefresh = false) {
   return stats;
 }
 
-// ---------- Recent tweets cache + paginator-based fetch ----------
+// ---------- Recent tweets cache + SINGLE-PAGE fetch (rate-limit friendly) ----------
 let recentTweetsCache = { tweets: [], timestamp: 0, ttl: 30 * 60 * 1000 };
+let primeRetryMs = 15 * 60 * 1000; // backoff for re-priming after 429 (min 15m, max 4h)
 
-// Fetch raw tweets (exact text) from your own timeline using the paginator
-async function fetchMyTweetsRaw(count = 200) {
+async function fetchMyTweetsRaw(count = 100) {
   try {
     let userId = process.env.TWITTER_USER_ID;
     if (!userId) {
@@ -361,28 +378,36 @@ async function fetchMyTweetsRaw(count = 200) {
       console.log('Got Twitter user ID:', userId);
     }
 
+    // Fetch ONLY ONE PAGE to avoid 429s.
     const paginator = await twitterClient.v2.userTimeline(userId, {
-      max_results: Math.min(100, count),
+      // 5..100; stay conservative to reduce payload
+      max_results: Math.min(100, Math.max(20, count)),
       exclude: ['retweets', 'replies'],
       'tweet.fields': ['created_at', 'text']
     });
 
-    const texts = [];
-    for await (const tweet of paginator) {
-      const text = tweet?.text;
-      if (!text) continue;
-      texts.push(text);
-      if (texts.length >= count) break;
-    }
+    // twitter-api-v2 exposes first page tweets via `.tweets`
+    const texts = (paginator?.tweets || [])
+      .map(t => t?.text)
+      .filter(Boolean);
+
     console.log(`Fetched ${texts.length} raw tweet(s) from timeline`);
     return texts;
   } catch (error) {
     console.error('fetchMyTweetsRaw failed:', error?.message || error);
+    if (error?.code === 429 || error?.status === 429) {
+      // Simple backoff: mark cache as "fresh" with empty to throttle retries
+      recentTweetsCache.timestamp = Date.now();
+      recentTweetsCache.ttl = Math.min(4 * 60 * 60 * 1000, primeRetryMs);
+      // Schedule a background re-prime attempt (non-fatal if process dies)
+      setTimeout(() => primePostedHashesFromTimeline(100), primeRetryMs);
+      primeRetryMs = Math.min(primeRetryMs * 2, 4 * 60 * 60 * 1000);
+    }
     return [];
   }
 }
 
-// Return cleaned tweets for similarity (kept separate from hashing)
+// Cleaned tweets for similarity (kept separate from hashing)
 async function getRecentTweets(count = 20) {
   if (recentTweetsCache.tweets?.length > 0 &&
       (Date.now() - recentTweetsCache.timestamp) < recentTweetsCache.ttl) {
@@ -411,9 +436,8 @@ async function getRecentTweets(count = 20) {
   return cleaned;
 }
 
-// Build postedHashes from the live timeline so restarts don't repeat
-// IMPORTANT: we hash the *trimmed* text, exactly like what was posted.
-async function primePostedHashesFromTimeline(seedCount = 200) {
+// Seed postedHashes from the live timeline; if 429, we retry later automatically
+async function primePostedHashesFromTimeline(seedCount = 100) {
   try {
     const rawTweets = await fetchMyTweetsRaw(seedCount);
     let added = 0;
@@ -427,8 +451,11 @@ async function primePostedHashesFromTimeline(seedCount = 200) {
     }
     if (added > 0) {
       await saveHashes();
+      console.log(`Primed ${added} hash(es) from existing timeline`);
+      primeRetryMs = 15 * 60 * 1000; // reset backoff after success
+    } else {
+      console.log('Priming found 0 new hashes (maybe already up to date)');
     }
-    console.log(`Primed ${added} hash(es) from existing timeline`);
   } catch (e) {
     console.error('Failed to prime posted hashes:', e?.message || e);
   }
@@ -493,9 +520,9 @@ Check for:
 
 Respond only "YES" if too similar/formulaic, or "NO" if sufficiently different.`;
   try {
-    const resp = await chatOnce({ prompt, max: 10 });
-    const content = resp?.choices?.[0]?.message?.content ?? '';
-    const verdict = content.trim().toUpperCase();
+    const resp = await chatOnce({ prompt, max: 50 });
+    const content = extractOpenAIText(resp);
+    const verdict = (content || '').trim().toUpperCase();
     return verdict.includes('YES');
   } catch (e) {
     console.error('OpenAI similarity check failed:', e?.message || e);
@@ -504,6 +531,8 @@ Respond only "YES" if too similar/formulaic, or "NO" if sufficiently different.`
 }
 
 // ---------- Builders ----------
+const usedFallbacksThisRun = new Set(); // avoid repeating a fallback within the same process
+
 async function generateProtocolTweet(maxAttempts = 5) {
   const recentTweets = await getRecentTweets();
   const triedStyles  = new Set();
@@ -572,9 +601,8 @@ CRITICAL:
 - Sound human; have an opinion`;
 
     try {
-      const resp = await chatOnce({ prompt, max: 500 });
-      const raw  = resp?.choices?.[0]?.message?.content ?? '';
-      let generated = raw.trim();
+      const resp = await chatOnce({ prompt, max: 220 });
+      let generated = extractOpenAIText(resp).trim();
       if (!generated) { console.warn('Empty OpenAI content; retrying…'); continue; }
 
       // Trim first, then check hash (so it matches posted text)
@@ -596,19 +624,27 @@ CRITICAL:
     }
   }
 
-  // Fallbacks
+  // Fallbacks (avoid repeating within the same run)
   const fallbacks = [
-    `Did you know? Every iAERO holder owns a piece of permanently locked veAERO. The lock never expires, but your tokens stay liquid. Best of both worlds.`,
-    `Thread: Why permanent locks beat 4-year locks 🧵\n\n1) No re-lock cycles\n2) Tokens stay liquid\n3) Same voting power\n4) Exit anytime\n\nThat’s iAERO.`,
-    `Fun fact: iAERO stakers earn fees while 4-year lockers wait for unlocks. Time in market > timing market.`,
-    `0.95 iAERO per AERO locked. That 5% funds the liquid wrapper you can exit anytime. Fair trade.`,
-    `Question for lockers: What if you need liquidity before 2028?\n\niAERO: “We can sell anytime.”`,
-    `Myth: You must lock for max rewards.\nReality: iAERO earns the same with zero unlock date.`
+    "Nobody:\nAbsolutely nobody:\nMe checking if my 4-year lock has expired yet: 🤡\n\n(this post made by iAERO gang)",
+    "Breaking: Area man discovers one weird trick to avoid 4-year lockups. ve(3,3) protocols hate him! 🗞️",
+    "gm to everyone except those still doing 4 year locks in 2025. Permanent lock + liquid token or ngmi 💀",
+    "Wife: why are his tokens free and yours locked till 2028?\nMe: there's this escrow—\nWife: *leaves with iAERO chad*",
+    "Year 2028: tokens unlock. iAERO holders: already traded, earned, collateralized. 📅",
+    "Therapist: Liquid permanent locks aren’t real.\niAERO: *exists*\nTraditional ve(3,3): 😰",
+    "Did you know? Every iAERO holder owns a piece of permanently locked veAERO. The lock never expires, but your tokens stay liquid. Best of both worlds.",
+    "Thread: Why permanent locks beat 4-year locks 🧵\n\n1) No re-lock cycles\n2) Tokens stay liquid\n3) Same voting power\n4) Exit anytime\n\nThat’s iAERO.",
+    "Fun fact: iAERO stakers earn fees while 4-year lockers wait for unlocks. Time in market > timing market.",
+    "0.95 iAERO per AERO locked. That 5% funds the liquid wrapper you can exit anytime. Fair trade.",
+    "Question for lockers: What if you need liquidity before 2028?\n\niAERO: “We can sell anytime.”",
+    "Myth: You must lock for max rewards.\nReality: iAERO earns the same with zero unlock date."
   ];
   for (const fb of fallbacks.sort(() => Math.random() - 0.5)) {
+    if (usedFallbacksThisRun.has(fb)) continue;
     const trimmed = safeTrimTweet(fb, 280);
     const h = hashTweet(trimmed);
     if (!postedHashes.has(h) && !(await isTwitterSimilar(trimmed, recentTweets, 0.3))) {
+      usedFallbacksThisRun.add(fb);
       console.log('Using creative fallback tweet'); return trimmed;
     }
   }
@@ -647,12 +683,10 @@ Requirements:
 - Avoid generic promo`;
 
     try {
-      const resp = await chatOnce({ prompt, max: 500 });
-      const raw  = resp?.choices?.[0]?.message?.content ?? '';
-      let generated = raw.trim();
+      const resp = await chatOnce({ prompt, max: 220 });
+      let generated = extractOpenAIText(resp).trim();
       if (!generated) { console.warn('Empty OpenAI content; retrying…'); continue; }
 
-      // Trim first, then hash
       generated = safeTrimTweet(generated, 280);
       const tweetHash = hashTweet(generated);
       if (postedHashes.has(tweetHash)) { console.log(`Shitpost hash exists (attempt ${attempt+1}); regenerating…`); continue; }
@@ -679,9 +713,11 @@ Requirements:
     "Therapist: Liquid permanent locks aren’t real.\niAERO: *exists*\nTraditional ve(3,3): 😰"
   ];
   for (const fb of fallbacks.sort(() => Math.random() - 0.5)) {
+    if (usedFallbacksThisRun.has(fb)) continue;
     const trimmed = safeTrimTweet(fb, 280);
     const h = hashTweet(trimmed);
     if (!postedHashes.has(h) && !(await isTwitterSimilar(trimmed, recentTweets, 0.35))) {
+      usedFallbacksThisRun.add(fb);
       console.log('Using fallback shitpost'); return trimmed;
     }
   }
@@ -689,13 +725,28 @@ Requirements:
   return null;
 }
 
+// ---------- Duplicate error detection ----------
+function isDuplicateTweetError(err) {
+  const msg = (err?.data?.detail || err?.data?.title || err?.message || '').toLowerCase();
+  const codes = new Set((err?.data?.errors || []).map(e => e?.code));
+  return (
+    err?.code === 403 ||
+    err?.status === 403 ||
+    msg.includes('duplicate') ||
+    msg.includes('already posted') ||
+    codes.has?.(186) || // legacy duplicate status
+    codes.has?.(187)
+  );
+}
+
 // ---------- Posting loop ----------
 async function postTweet(retries = 2) {
   let lastError = null;
   for (let i = 0; i <= retries; i++) {
+    let content = null;
     try {
       const isProtocolTweet = Math.random() < 0.7;
-      let content = isProtocolTweet ? await generateProtocolTweet() : await generateShitpost();
+      content = isProtocolTweet ? await generateProtocolTweet() : await generateShitpost();
 
       if (!content) { console.log('No tweet content generated; skip this cycle'); return null; }
 
@@ -718,7 +769,19 @@ async function postTweet(retries = 2) {
     } catch (error) {
       lastError = error;
       console.error(`Failed to post tweet (attempt ${i + 1}/${retries + 1}):`, error?.message || error);
-      if (error?.code === 429) { console.log('Rate limited; will retry later'); break; }
+      // If Twitter says it's a duplicate, record the hash so we don't try again.
+      if (content && isDuplicateTweetError(error)) {
+        const h = hashTweet(safeTrimTweet(content, 280));
+        if (!postedHashes.has(h)) {
+          console.log('Marking duplicate tweet hash to avoid future attempts');
+          postedHashes.add(h);
+          await saveHashes();
+        }
+      }
+      if (error?.code === 429 || error?.status === 429) {
+        console.log('Rate limited; stopping retries to avoid ban');
+        break;
+      }
       if (i < retries) {
         const wait = Math.min(1000 * Math.pow(2, i), 10000);
         console.log(`Waiting ${wait}ms before retry…`);
@@ -761,7 +824,7 @@ async function startBot() {
   });
 
   await loadHashes();
-  await primePostedHashesFromTimeline(200); // <-- seed dedupe from your real timeline
+  await primePostedHashesFromTimeline(80); // single-page seed; re-prime will reschedule if 429
 
   console.log('Initializing stats cache…');
   const testStats = await getProtocolStats(true);
@@ -791,6 +854,9 @@ async function startBot() {
   console.log('Registering recurring tweet scheduler…');
   scheduleNextTweet();
   console.log('Scheduler registered.');
+
+  // Periodic re-priming from timeline (helps after transient 429s or container restarts)
+  setInterval(() => primePostedHashesFromTimeline(80), 3 * 60 * 60 * 1000);
 
   // Daily stats at 14:00 UTC (idempotent)
   cron.schedule('0 14 * * *', async () => {
@@ -826,6 +892,10 @@ Lock. Stake. Earn. Stay liquid.`;
         await saveHashes();
       } catch (err) {
         console.error('Failed to post daily stats:', err?.message || err);
+        if (isDuplicateTweetError(err)) {
+          postedHashes.add(h);
+          await saveHashes();
+        }
       }
     }
   });

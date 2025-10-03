@@ -60,7 +60,7 @@ async function chatOnce({ prompt, max = 220 }) {
       const resp = await openai.chat.completions.create({
         model,
         messages: [{ role: 'user', content: prompt }],
-        max_tokens: max,
+        max_completion_tokens: max,
         // Keep params light; GPT-5 ignores temp anyway
         temperature: model.startsWith('gpt-5') ? undefined : 0.9,
         presence_penalty: model.startsWith('gpt-5') ? undefined : 0.6,

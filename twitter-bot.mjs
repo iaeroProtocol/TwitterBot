@@ -348,60 +348,89 @@ async function getProtocolStats(forceRefresh = false) {
   return stats;
 }
 
-// ---------- Recent tweets cache ----------
+// ---------- Recent tweets cache + paginator-based fetch ----------
 let recentTweetsCache = { tweets: [], timestamp: 0, ttl: 30 * 60 * 1000 };
 
+// Fetch raw tweets (exact text) from your own timeline using the paginator
+async function fetchMyTweetsRaw(count = 200) {
+  try {
+    let userId = process.env.TWITTER_USER_ID;
+    if (!userId) {
+      const me = await twitterClient.v2.me();
+      userId = me.data.id;
+      console.log('Got Twitter user ID:', userId);
+    }
+
+    const paginator = await twitterClient.v2.userTimeline(userId, {
+      max_results: Math.min(100, count),
+      exclude: ['retweets', 'replies'],
+      'tweet.fields': ['created_at', 'text']
+    });
+
+    const texts = [];
+    for await (const tweet of paginator) {
+      const text = tweet?.text;
+      if (!text) continue;
+      texts.push(text);
+      if (texts.length >= count) break;
+    }
+    console.log(`Fetched ${texts.length} raw tweet(s) from timeline`);
+    return texts;
+  } catch (error) {
+    console.error('fetchMyTweetsRaw failed:', error?.message || error);
+    return [];
+  }
+}
+
+// Return cleaned tweets for similarity (kept separate from hashing)
 async function getRecentTweets(count = 20) {
   if (recentTweetsCache.tweets?.length > 0 &&
       (Date.now() - recentTweetsCache.timestamp) < recentTweetsCache.ttl) {
     console.log('Using cached recent tweets');
     return recentTweetsCache.tweets;
   }
+
+  const raw = await fetchMyTweetsRaw(count);
+  const cleaned = raw
+    .map(t =>
+      t
+        .replace(/https?:\/\/\S+/g, '')  // remove links
+        .replace(/@\w+/g, '')            // remove mentions
+        .replace(/#(\w+)/g, '$1')        // drop '#' but keep the word
+        .replace(/\s+/g, ' ')
+        .trim()
+    )
+    .filter(t => t.length > 10);
+
+  if (cleaned.length > 0) {
+    recentTweetsCache = { tweets: cleaned, timestamp: Date.now(), ttl: recentTweetsCache.ttl };
+    console.log(`Cached ${cleaned.length} cleaned tweet(s) for similarity checks`);
+  } else {
+    console.log('No recent tweets available for similarity; cache remains as-is');
+  }
+  return cleaned;
+}
+
+// Build postedHashes from the live timeline so restarts don't repeat
+// IMPORTANT: we hash the *trimmed* text, exactly like what was posted.
+async function primePostedHashesFromTimeline(seedCount = 200) {
   try {
-    console.log(`Fetching last ${count} tweets...`);
-    let userId = process.env.TWITTER_USER_ID;
-    if (!userId) {
-      try {
-        const me = await twitterClient.v2.me();
-        userId = me.data.id;
-        console.log('Got Twitter user ID:', userId);
-      } catch (meError) {
-        console.error('Failed to get user ID:', meError?.message || meError);
-        if (meError?.code === 429 || meError?.status === 429) {
-          console.log('Rate limited on getting user ID, will retry later');
-          return recentTweetsCache.tweets || [];
-        }
-        return recentTweetsCache.tweets || [];
+    const rawTweets = await fetchMyTweetsRaw(seedCount);
+    let added = 0;
+    for (const t of rawTweets.reverse()) { // oldest -> newest
+      const finalText = safeTrimTweet(t, 280);
+      const h = hashTweet(finalText);
+      if (!postedHashes.has(h)) {
+        postedHashes.add(h);
+        added++;
       }
     }
-    const timeline = await twitterClient.v2.userTimeline(userId, {
-      max_results: Math.min(count, 100),
-      exclude: ['retweets', 'replies'],
-      'tweet.fields': ['created_at', 'text']
-    });
-    const tweetObjs = timeline?.data?.data ?? timeline?.data ?? [];
-    const tweetTexts = [];
-    for (const t of tweetObjs) {
-      const text = t?.text;
-      if (!text) continue;
-      const clean = text.replace(/https?:\/\/\S+/g, '').replace(/@\w+/g, '').replace(/#/g, '').trim();
-      if (clean.length > 10) tweetTexts.push(clean);
+    if (added > 0) {
+      await saveHashes();
     }
-    if (tweetTexts.length > 0) {
-      recentTweetsCache = { tweets: tweetTexts, timestamp: Date.now(), ttl: recentTweetsCache.ttl };
-      console.log(`Retrieved ${tweetTexts.length} recent tweets`);
-    } else {
-      console.log('No tweets retrieved, using previous cache if available');
-    }
-    return tweetTexts.length > 0 ? tweetTexts : (recentTweetsCache.tweets || []);
-  } catch (error) {
-    console.error('Failed to fetch recent tweets:', error?.message || error);
-    if (error?.code === 429 || error?.status === 429) {
-      console.log('Rate limited by Twitter API, using cached tweets');
-      recentTweetsCache.timestamp = Date.now();
-      recentTweetsCache.ttl       = 45 * 60 * 1000; // silence retries for a while
-    }
-    return recentTweetsCache.tweets || [];
+    console.log(`Primed ${added} hash(es) from existing timeline`);
+  } catch (e) {
+    console.error('Failed to prime posted hashes:', e?.message || e);
   }
 }
 
@@ -545,9 +574,11 @@ CRITICAL:
     try {
       const resp = await chatOnce({ prompt, max: 500 });
       const raw  = resp?.choices?.[0]?.message?.content ?? '';
-      const generated = raw.trim();
+      let generated = raw.trim();
       if (!generated) { console.warn('Empty OpenAI content; retrying…'); continue; }
 
+      // Trim first, then check hash (so it matches posted text)
+      generated = safeTrimTweet(generated, 280);
       const tweetHash = hashTweet(generated);
       if (postedHashes.has(tweetHash)) { console.log(`Hash exists (attempt ${attempt+1}); regenerating…`); continue; }
 
@@ -575,9 +606,10 @@ CRITICAL:
     `Myth: You must lock for max rewards.\nReality: iAERO earns the same with zero unlock date.`
   ];
   for (const fb of fallbacks.sort(() => Math.random() - 0.5)) {
-    const h = hashTweet(fb);
-    if (!postedHashes.has(h) && !(await isTwitterSimilar(fb, recentTweets, 0.3))) {
-      console.log('Using creative fallback tweet'); return fb;
+    const trimmed = safeTrimTweet(fb, 280);
+    const h = hashTweet(trimmed);
+    if (!postedHashes.has(h) && !(await isTwitterSimilar(trimmed, recentTweets, 0.3))) {
+      console.log('Using creative fallback tweet'); return trimmed;
     }
   }
   console.error('Could not generate unique tweet');
@@ -617,9 +649,11 @@ Requirements:
     try {
       const resp = await chatOnce({ prompt, max: 500 });
       const raw  = resp?.choices?.[0]?.message?.content ?? '';
-      const generated = raw.trim();
+      let generated = raw.trim();
       if (!generated) { console.warn('Empty OpenAI content; retrying…'); continue; }
 
+      // Trim first, then hash
+      generated = safeTrimTweet(generated, 280);
       const tweetHash = hashTweet(generated);
       if (postedHashes.has(tweetHash)) { console.log(`Shitpost hash exists (attempt ${attempt+1}); regenerating…`); continue; }
 
@@ -645,9 +679,10 @@ Requirements:
     "Therapist: Liquid permanent locks aren’t real.\niAERO: *exists*\nTraditional ve(3,3): 😰"
   ];
   for (const fb of fallbacks.sort(() => Math.random() - 0.5)) {
-    const h = hashTweet(fb);
-    if (!postedHashes.has(h) && !(await isTwitterSimilar(fb, recentTweets, 0.35))) {
-      console.log('Using fallback shitpost'); return fb;
+    const trimmed = safeTrimTweet(fb, 280);
+    const h = hashTweet(trimmed);
+    if (!postedHashes.has(h) && !(await isTwitterSimilar(trimmed, recentTweets, 0.35))) {
+      console.log('Using fallback shitpost'); return trimmed;
     }
   }
   console.error('Could not generate unique shitpost; skipping');
@@ -664,10 +699,15 @@ async function postTweet(retries = 2) {
 
       if (!content) { console.log('No tweet content generated; skip this cycle'); return null; }
 
-      const tweetHash = hashTweet(content);
-      if (postedHashes.has(tweetHash)) { console.log('Hash collision pre-post; regenerating…'); continue; }
-
+      // TRIM FIRST, THEN HASH (so local and remote hashes match)
       content = safeTrimTweet(content, 280);
+      const tweetHash = hashTweet(content);
+
+      if (postedHashes.has(tweetHash)) {
+        console.log('Hash collision pre-post (already tweeted this exact text); regenerating…');
+        continue;
+      }
+
       console.log(`[${new Date().toISOString()}] Posting tweet:`, content);
 
       const tweet = await twitterClient.v2.tweet(content);
@@ -721,6 +761,7 @@ async function startBot() {
   });
 
   await loadHashes();
+  await primePostedHashesFromTimeline(200); // <-- seed dedupe from your real timeline
 
   console.log('Initializing stats cache…');
   const testStats = await getProtocolStats(true);
@@ -751,7 +792,7 @@ async function startBot() {
   scheduleNextTweet();
   console.log('Scheduler registered.');
 
-  // Daily stats at 14:00 UTC
+  // Daily stats at 14:00 UTC (idempotent)
   cron.schedule('0 14 * * *', async () => {
     console.log('Posting daily stats tweet…');
     const stats = await getProtocolStats(true);
@@ -770,11 +811,18 @@ Prices:
 • iAERO/AERO: ${stats.iAeroPeg}
 
 Lock. Stake. Earn. Stay liquid.`;
+
       statsTweet = safeTrimTweet(statsTweet, 280);
+      const h = hashTweet(statsTweet);
+      if (postedHashes.has(h)) {
+        console.log('Daily stats tweet is identical to a previous one; skipping');
+        return;
+      }
+
       try {
         const tw = await twitterClient.v2.tweet(statsTweet);
         console.log('Daily stats tweet posted:', tw?.data?.id);
-        postedHashes.add(hashTweet(statsTweet));
+        postedHashes.add(h);
         await saveHashes();
       } catch (err) {
         console.error('Failed to post daily stats:', err?.message || err);
@@ -826,4 +874,3 @@ startBot().catch(async err => {
   await saveHashes();
   process.exit(1);
 });
-

@@ -1,4 +1,4 @@
-// twitter-bot.mjs — Production version with GPT-5 wrapper, local tweet-log persistence, 403-aware dedupe
+// twitter-bot.mjs — Production: persistent dedupe, rate-limit safe, no manual fallbacks
 import 'dotenv/config';
 import { TwitterApi } from 'twitter-api-v2';
 import OpenAI from 'openai';
@@ -10,20 +10,17 @@ import fs from 'fs/promises';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
-// ---------- ESM paths ----------
+/* ============================== ESM paths =============================== */
 const __filename = fileURLToPath(import.meta.url);
 const __dirname  = path.dirname(__filename);
 
-// ---------- Health check (Railway) ----------
+/* ============================== Healthcheck ============================= */
 const app  = express();
-const PORT = process.env.PORT || 3001;
-
-app.get('/health', (_req, res) => {
-  res.status(200).json({ status: 'ok', uptime: process.uptime() });
-});
+const PORT = process.env.PORT || 8080;
+app.get('/health', (_req, res) => res.status(200).json({ status: 'ok', uptime: process.uptime() }));
 app.listen(PORT, () => console.log(`Health check server on :${PORT}`));
 
-// ---------- Clients ----------
+/* ============================== Clients ================================= */
 const twitterClient = new TwitterApi({
   appKey:       process.env.TWITTER_API_KEY,
   appSecret:    process.env.TWITTER_API_SECRET,
@@ -33,13 +30,12 @@ const twitterClient = new TwitterApi({
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-const DEBUG_STATS        = process.env.DEBUG_STATS === '1';
 const OPENAI_ENABLED     = !!process.env.OPENAI_API_KEY;
 const OPENAI_MODEL       = process.env.OPENAI_MODEL || 'gpt-5-mini';
-const isGpt5Family       = OPENAI_MODEL.startsWith('gpt-5');
 const STRICT_ORIGINALITY = OPENAI_ENABLED && process.env.STRICT_ORIGINALITY === '1';
+const DEBUG_STATS        = process.env.DEBUG_STATS === '1';
 
-// ---------- OpenAI wrapper (use max_tokens + robust extraction) ----------
+/* ============================== OpenAI wrapper ========================== */
 function extractOpenAIText(resp) {
   const msg = resp?.choices?.[0]?.message;
   if (!msg) return '';
@@ -49,29 +45,43 @@ function extractOpenAIText(resp) {
   }
   return '';
 }
-async function chatOnce({ prompt, max = 220, legacyTuning }) {
-  const base = { model: OPENAI_MODEL, messages: [{ role: 'user', content: prompt }] };
-  const legacy = legacyTuning || { temperature: 0.9, presence_penalty: 0.6, frequency_penalty: 0.6 };
 
-  if (isGpt5Family) {
-    return openai.chat.completions.create({ ...base, max_completion_tokens: max });
+// Try primary model, then small fallback(s)
+async function chatOnce({ prompt, max = 220 }) {
+  const models = [
+    OPENAI_MODEL,
+    'gpt-4o-mini',
+    'gpt-4o'
+  ].filter(Boolean);
+
+  let lastErr;
+  for (const model of models) {
+    try {
+      const resp = await openai.chat.completions.create({
+        model,
+        messages: [{ role: 'user', content: prompt }],
+        max_tokens: max,
+        // Keep params light; GPT-5 ignores temp anyway
+        temperature: model.startsWith('gpt-5') ? undefined : 0.9,
+        presence_penalty: model.startsWith('gpt-5') ? undefined : 0.6,
+        frequency_penalty: model.startsWith('gpt-5') ? undefined : 0.6
+      });
+      return resp;
+    } catch (e) {
+      lastErr = e;
+      console.error(`[OpenAI] ${model} failed:`, e?.message || e);
+    }
   }
-  return openai.chat.completions.create({
-    ...base,
-    max_completion_tokens: max,
-    temperature: legacy.temperature,
-    presence_penalty: legacy.presence_penalty,
-    frequency_penalty: legacy.frequency_penalty
-  });
+  throw lastErr || new Error('All OpenAI models failed');
 }
 
-// ---------- Chain provider ----------
+/* ============================== Chain provider ========================== */
 const provider = new ethers.JsonRpcProvider(process.env.RPC_URL || 'https://mainnet.base.org');
 
-// ---------- Stats cache ----------
+/* ============================== Stats cache ============================= */
 let statsCache = { data: null, timestamp: 0, ttl: 5 * 60 * 1000 };
 
-// ---------- Data dir + persistence (hashes + tweet log) ----------
+/* ============================== Data dir & persistence ================== */
 let DATA_DIR = null;
 let HASH_FILE = null;
 let TWEET_LOG_FILE = null;
@@ -79,20 +89,16 @@ let TWEET_LOG_FILE = null;
 async function initDataFiles() {
   const candidates = [
     process.env.DATA_DIR,
-    '/data',
-    '/var/data',
-    '/mnt/data',
+    '/data', '/var/data', '/mnt/data',
     path.join(__dirname, 'data')
   ].filter(Boolean);
 
   for (const dir of candidates) {
     try {
       await fs.mkdir(dir, { recursive: true });
-      const testFile = path.join(dir, '.rwtest');
-      await fs.writeFile(testFile, 'ok');
-      await fs.unlink(testFile);
-      DATA_DIR = dir;
-      break;
+      const t = path.join(dir, '.rwtest');
+      await fs.writeFile(t, 'ok'); await fs.unlink(t);
+      DATA_DIR = dir; break;
     } catch {}
   }
   if (!DATA_DIR) DATA_DIR = path.join(__dirname, 'data');
@@ -100,13 +106,16 @@ async function initDataFiles() {
 
   HASH_FILE = path.join(DATA_DIR, 'tweet-hashes.json');
   TWEET_LOG_FILE = path.join(DATA_DIR, 'tweet-log.json');
-
   console.log('Data directory set to:', DATA_DIR);
 }
 
-// ---------- Hash-based dedupe ----------
+/* ============================== Hash dedupe ============================= */
 let postedHashes = new Set();
 
+function hashTweet(content) {
+  const normalized = (content || '').trim().toLowerCase().replace(/\s+/g, ' ');
+  return crypto.createHash('sha256').update(normalized).digest('hex').slice(0, 16);
+}
 async function loadHashes() {
   try {
     const data = await fs.readFile(HASH_FILE, 'utf8');
@@ -121,16 +130,12 @@ async function saveHashes() {
   try {
     const toSave = [...postedHashes].slice(-500);
     await fs.writeFile(HASH_FILE, JSON.stringify(toSave, null, 2), 'utf8');
-  } catch (err) {
-    console.error('Failed to save hashes:', err?.message || err);
+  } catch (e) {
+    console.error('Failed to save hashes:', e?.message || e);
   }
 }
-function hashTweet(content) {
-  const normalized = (content || '').trim().toLowerCase().replace(/\s+/g, ' ');
-  return crypto.createHash('sha256').update(normalized).digest('hex').slice(0, 16);
-}
 
-// ---------- Local tweet log (exact trimmed text for similarity when 429) ----------
+/* ============================== Local tweet log ========================= */
 let tweetLog = [];
 
 async function loadTweetLog() {
@@ -148,25 +153,12 @@ async function saveTweetLog() {
   try {
     const last500 = tweetLog.slice(-500);
     await fs.writeFile(TWEET_LOG_FILE, JSON.stringify(last500, null, 2), 'utf8');
-  } catch (err) {
-    console.error('Failed to save tweet log:', err?.message || err);
+  } catch (e) {
+    console.error('Failed to save tweet log:', e?.message || e);
   }
 }
 
-// ---------- Topic cooldowns ----------
-const topicCooldowns = new Map();
-const TOPIC_COOLDOWN_DAYS = 2;
-
-function isTopicOnCooldown(topic) {
-  const t = topicCooldowns.get(topic);
-  if (!t) return false;
-  return ((Date.now() - t) / (1000 * 60 * 60 * 24)) < TOPIC_COOLDOWN_DAYS;
-}
-function markTopicUsed(topic) {
-  topicCooldowns.set(topic, Date.now());
-}
-
-// ---------- Topics ----------
+/* ============================== Topics & helpers ======================== */
 const PROTOCOL_TOPICS = [
   "How iAERO's liquid staking works",
   "Benefits of permanent AERO locking vs 4-year locks",
@@ -179,35 +171,28 @@ const PROTOCOL_TOPICS = [
   "iAERO/AERO peg stability mechanics",
   "Staking rewards and current APR"
 ];
-
 const SHITPOST_TOPICS = [
   "Market volatility","DeFi yields","Airdrop farming","Gas fees","Crypto Twitter drama",
   "Bull/bear market memes","Liquidity mining","Protocol wars on Base",
   "Whale movements","CEX vs DEX debate"
 ];
 
-// ---------- Minimal ABIs ----------
-const ERC20_DECIMALS_ABI = ['function decimals() view returns (uint8)'];
-const PAIR_ABI = [
-  'function getReserves() view returns (uint256,uint256,uint256)',
-  'function token0() view returns (address)',
-  'function token1() view returns (address)'
-];
+const topicCooldowns = new Map();
+const TOPIC_COOLDOWN_DAYS = 2;
+function isTopicOnCooldown(topic){ const t = topicCooldowns.get(topic); return t ? ((Date.now()-t)/(1000*60*60*24)) < TOPIC_COOLDOWN_DAYS : false; }
+function markTopicUsed(topic){ topicCooldowns.set(topic, Date.now()); }
 
-// ---------- Helpers ----------
-function compactUSDorToken(n) {
-  if (!isFinite(n) || n <= 0) return '0';
-  if (n >= 1_000_000) return (n / 1_000_000).toFixed(2) + 'M';
-  if (n >= 1_000)     return (n / 1_000).toFixed(0) + 'K';
-  return n.toFixed(0);
-}
-function safeTrimTweet(tweet, maxLength = 280) {
-  const chars = [...(tweet || '')];
-  if (chars.length <= maxLength) return tweet || '';
-  return chars.slice(0, maxLength - 1).join('') + '…';
-}
+function compactUSDorToken(n){ if(!isFinite(n)||n<=0) return '0'; if(n>=1_000_000) return (n/1_000_000).toFixed(2)+'M'; if(n>=1_000) return (n/1_000).toFixed(0)+'K'; return n.toFixed(0); }
+function safeTrimTweet(t, max=280){ const s=[...(t||'')]; return s.length<=max ? (t||'') : s.slice(0,max-1).join('')+'…'; }
+function pick(arr){ return arr[Math.floor(Math.random()*arr.length)]; }
 
+/* ============================== On-chain stats ========================== */
 async function readPair(pairAddr) {
+  const PAIR_ABI = [
+    'function getReserves() view returns (uint256,uint256,uint256)',
+    'function token0() view returns (address)',
+    'function token1() view returns (address)'
+  ];
   const pair = new ethers.Contract(pairAddr, PAIR_ABI, provider);
   const token0 = (await pair.token0()).toLowerCase();
   const token1 = (await pair.token1()).toLowerCase();
@@ -215,6 +200,7 @@ async function readPair(pairAddr) {
   return { token0, token1, reserve0, reserve1 };
 }
 async function resolveCoreTokens(cfg) {
+  const ERC20_DECIMALS_ABI = ['function decimals() view returns (uint8)'];
   const usdc = cfg.USDC.toLowerCase();
   const aeroPair = await readPair(cfg.AERO_USDC_POOL);
   const AERO = (aeroPair.token0 === usdc) ? aeroPair.token1 : aeroPair.token0;
@@ -225,17 +211,10 @@ async function resolveCoreTokens(cfg) {
 
   const decMap = new Map();
   async function putDecimals(addr) {
-    try {
-      const c = new ethers.Contract(addr, ERC20_DECIMALS_ABI, provider);
-      const d = await c.decimals();
-      decMap.set(addr.toLowerCase(), Number(d));
-    } catch {
-      decMap.set(addr.toLowerCase(), 18);
-    }
+    try { const c = new ethers.Contract(addr, ERC20_DECIMALS_ABI, provider); const d = await c.decimals(); decMap.set(addr.toLowerCase(), Number(d)); }
+    catch { decMap.set(addr.toLowerCase(), 18); }
   }
-  await putDecimals(AERO); await putDecimals(LIQ);
-  await putDecimals(IAERO); await putDecimals(usdc);
-
+  await putDecimals(AERO); await putDecimals(LIQ); await putDecimals(IAERO); await putDecimals(usdc);
   return { tokens: { AERO, LIQ, IAERO, USDC: usdc }, decimals: decMap };
 }
 async function pairPrice(pairAddr, baseAddr, quoteAddr, decMap) {
@@ -255,74 +234,49 @@ async function pairPrice(pairAddr, baseAddr, quoteAddr, decMap) {
   if (baseFloat === 0) throw new Error('zero base reserve');
   return quoteFloat / baseFloat;
 }
-
-// ---------- Docs context ----------
-function getDocumentationContext() {
-  return {
-    keyFacts: [
-      "iAERO is a liquid staking protocol on Base network",
-      "Users lock AERO permanently and receive liquid iAERO tokens at 0.95:1 ratio",
-      "5% protocol fee means you get 0.95 iAERO for every 1 AERO deposited",
-      "iAERO can be traded on DEXs while earning staking rewards",
-      "Stakers of iAERO earn 80% of all protocol fees",
-      "Protocol treasury receives 20% of fees",
-      "LIQ token has a halving emission schedule every 5M tokens",
-      "stiAERO (staked iAERO) can be used as collateral for borrowing",
-      "Protocol owns permanently locked veAERO NFTs",
-      "No unlock period - iAERO is always liquid and tradeable",
-      "iAERO maintains peg through arbitrage opportunities",
-      "Staking rewards are distributed weekly after epoch ends",
-      "Protocol is non-custodial and immutable"
-    ],
-    stats: {
-      protocolFee: "5%",
-      stakerShare: "80%",
-      treasuryShare: "20%",
-      liqEmissionModel: "halving per 5M tokens",
-      stakingLockPeriod: "7 days (LIQ unstaking)",
-      conversionRatio: "0.95 iAERO per 1 AERO"
-    }
-  };
+function docsContext() {
+  return [
+    "iAERO is a liquid staking protocol on Base network",
+    "Users lock AERO permanently and receive liquid iAERO tokens at 0.95:1 ratio",
+    "Stakers of iAERO earn 80% of all protocol fees; treasury 20%",
+    "LIQ token has a halving emission schedule every 5M tokens",
+    "stiAERO (staked iAERO) can be used as collateral for borrowing",
+    "Protocol owns permanently locked veAERO NFTs; tokens remain liquid via iAERO",
+    "Peg stability relies on arbitrage between iAERO and AERO",
+  ].join('\n');
 }
-
-// ---------- GitBook cache ----------
 let gitBookCache = null;
 async function fetchGitBookContent() {
   if (gitBookCache) return gitBookCache;
-  const baseUrl = 'https://docs.iaero.finance';
-  const pages   = [
-    '/introduction/what-is-iaero',
-    '/getting-started/key-concepts-and-how-to',
-    '/getting-started/what-is-stiaero',
-    '/getting-started/the-magic-of-iaero',
-    '/tokenomics/iaero-token',
-    '/tokenomics/liq-token'
-  ];
   try {
-    console.log('Fetching GitBook documentation...');
+    const baseUrl = 'https://docs.iaero.finance';
+    const pages = [
+      '/introduction/what-is-iaero',
+      '/getting-started/key-concepts-and-how-to',
+      '/getting-started/what-is-stiaero',
+      '/getting-started/the-magic-of-iaero',
+      '/tokenomics/iaero-token',
+      '/tokenomics/liq-token'
+    ];
     const texts = [];
-    for (const page of pages) {
-      const r = await fetch(`${baseUrl}${page}`);
+    for (const p of pages) {
+      const r = await fetch(`${baseUrl}${p}`);
       if (!r.ok) continue;
       const html = await r.text();
-      const text = html.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 2000);
-      if (text) texts.push(text);
+      const txt = html.replace(/<[^>]*>/g,' ').replace(/\s+/g,' ').trim().slice(0,2000);
+      if (txt) texts.push(txt);
     }
-    gitBookCache = texts.join('\n\n');
-    return gitBookCache;
-  } catch (err) {
-    console.error('Failed to fetch GitBook:', err?.message || err);
+    gitBookCache = texts.join('\n\n'); return gitBookCache;
+  } catch (e) {
+    console.error('Failed to fetch GitBook:', e?.message || e);
     return null;
   }
 }
-
-// ---------- On-chain stats with caching ----------
-async function getProtocolStats(forceRefresh = false) {
-  if (!forceRefresh && statsCache.data && (Date.now() - statsCache.timestamp) < statsCache.ttl) {
+async function getProtocolStats(force = false) {
+  if (!force && statsCache.data && (Date.now()-statsCache.timestamp) < statsCache.ttl) {
     if (DEBUG_STATS) console.log('Returning cached stats');
     return statsCache.data;
   }
-
   console.log('Fetching fresh protocol stats...');
   const VAULT_ADDRESS   = process.env.VAULT_ADDRESS   || '0x877398Aea8B5cCB0D482705c2D88dF768c953957';
   const IAERO_AERO_POOL = process.env.IAERO_AERO_POOL || '0x08d49DA370ecfFBC4c6Fdd2aE82B2D6aE238Affd';
@@ -339,78 +293,63 @@ async function getProtocolStats(forceRefresh = false) {
   ];
   const vault = new ethers.Contract(VAULT_ADDRESS, VAULT_ABI, provider);
 
-  const retryCall = async (fn, fallback = 0, maxRetries = 5) => {
-    for (let i = 0; i < maxRetries; i++) {
+  const retry = async (fn, fallback=0, tries=5) => {
+    for (let i=0;i<tries;i++){
       try { return await fn(); }
-      catch (e) {
-        if (i < maxRetries - 1) {
-          const delay = Math.min(1000 * Math.pow(2, i), 5000);
-          await new Promise(r => setTimeout(r, delay));
-        }
+      catch {
+        if (i<tries-1) await new Promise(r=>setTimeout(r, Math.min(1000*(2**i), 5000)));
       }
     }
     return fallback;
   };
 
-  let aeroLockedNum = await retryCall(async () => parseFloat(ethers.formatEther(await vault.totalAEROLocked())));
-  if (!aeroLockedNum) {
-    aeroLockedNum = await retryCall(async () => parseFloat(ethers.formatEther(await vault.getTotalValueLocked())));
-  }
-  if (!aeroLockedNum) {
-    aeroLockedNum = await retryCall(async () => {
-      const vs = await vault.vaultStatus();
-      return parseFloat(ethers.formatEther(vs[0]));
-    });
-  }
-  console.log('✓ AERO locked:', aeroLockedNum);
+  let aeroLocked = await retry(async()=>parseFloat(ethers.formatEther(await vault.totalAEROLocked())));
+  if (!aeroLocked) aeroLocked = await retry(async()=>parseFloat(ethers.formatEther(await vault.getTotalValueLocked())));
+  if (!aeroLocked) aeroLocked = await retry(async()=>{ const vs = await vault.vaultStatus(); return parseFloat(ethers.formatEther(vs[0])); });
+  console.log('✓ AERO locked:', aeroLocked);
 
-  const liqMintedNum  = await retryCall(async () => parseFloat(ethers.formatEther(await vault.totalLIQMinted())));
-  const iAeroMintedNum= await retryCall(async () => parseFloat(ethers.formatEther(await vault.totalIAEROMinted())));
-  console.log('✓ LIQ minted:',  liqMintedNum);
-  console.log('✓ iAERO minted:',iAeroMintedNum);
+  const liqMinted   = await retry(async()=>parseFloat(ethers.formatEther(await vault.totalLIQMinted())));
+  const iaeroMinted = await retry(async()=>parseFloat(ethers.formatEther(await vault.totalIAEROMinted())));
+  console.log('✓ LIQ minted:',  liqMinted);
+  console.log('✓ iAERO minted:',iaeroMinted);
 
-  let aeroPrice = NaN, liqPrice = NaN, iaeroPeg = NaN;
+  let aeroPrice=NaN, liqPrice=NaN, iaeroPeg=NaN;
   try {
-    const { tokens, decimals } = await resolveCoreTokens({
-      AERO_USDC_POOL, LIQ_USDC_POOL, IAERO_AERO_POOL, USDC: USDC_ADDRESS
-    });
-    aeroPrice = await retryCall(async () => await pairPrice(AERO_USDC_POOL, tokens.AERO,  tokens.USDC, decimals), 0);
-    liqPrice  = await retryCall(async () => await pairPrice(LIQ_USDC_POOL,  tokens.LIQ,   tokens.USDC, decimals), 0);
-    iaeroPeg  = await retryCall(async () => await pairPrice(IAERO_AERO_POOL,tokens.IAERO, tokens.AERO, decimals), 1);
+    const { tokens, decimals } = await resolveCoreTokens({ AERO_USDC_POOL, LIQ_USDC_POOL, IAERO_AERO_POOL, USDC: USDC_ADDRESS });
+    aeroPrice = await retry(async()=>await pairPrice(AERO_USDC_POOL, tokens.AERO, tokens.USDC, decimals), 0);
+    liqPrice  = await retry(async()=>await pairPrice(LIQ_USDC_POOL,  tokens.LIQ,  tokens.USDC, decimals), 0);
+    iaeroPeg  = await retry(async()=>await pairPrice(IAERO_AERO_POOL,tokens.IAERO,tokens.AERO, decimals), 1);
     console.log('✓ AERO price:', aeroPrice);
     console.log('✓ LIQ price:',  liqPrice);
     console.log('✓ iAERO peg:',  iaeroPeg);
-  } catch (e) {
-    console.error('Price fetching failed:', e?.message || e);
-  }
+  } catch(e){ console.error('Price fetching failed:', e?.message || e); }
 
-  const tvlFloat = (isFinite(aeroPrice) && aeroLockedNum > 0) ? aeroLockedNum * aeroPrice : 0;
+  const tvlFloat = (isFinite(aeroPrice) && aeroLocked>0) ? aeroLocked*aeroPrice : 0;
   console.log('=== PROTOCOL STATS ===');
-  console.log('AERO Locked:', aeroLockedNum);
+  console.log('AERO Locked:', aeroLocked);
   console.log('AERO Price:', aeroPrice);
   console.log('TVL:', tvlFloat);
-  console.log('iAERO Minted:', iAeroMintedNum);
-  console.log('LIQ Minted:', liqMintedNum);
+  console.log('iAERO Minted:', iaeroMinted);
+  console.log('LIQ Minted:', liqMinted);
   console.log('====================');
 
   const stats = {
     tvl:         compactUSDorToken(tvlFloat),
     apy:         '30', // placeholder
-    totalStaked: compactUSDorToken(iAeroMintedNum),
+    totalStaked: compactUSDorToken(iaeroMinted),
     liqPrice:    isFinite(liqPrice)  ? liqPrice.toFixed(4)  : '0.0000',
-    aeroLocked:  compactUSDorToken(aeroLockedNum),
+    aeroLocked:  compactUSDorToken(aeroLocked),
     aeroPrice:   isFinite(aeroPrice) ? aeroPrice.toFixed(4) : '0.0000',
     iAeroPeg:    isFinite(iaeroPeg)  ? iaeroPeg.toFixed(4)  : '1.0000',
-    liqMinted:   compactUSDorToken(liqMintedNum)
+    liqMinted:   compactUSDorToken(liqMinted)
   };
-
   statsCache = { data: stats, timestamp: Date.now(), ttl: statsCache.ttl };
   return stats;
 }
 
-// ---------- Recent tweets (prefer Twitter, fallback to local tweet log) ----------
+/* ============================== Timeline & similarity =================== */
 let recentTweetsCache = { tweets: [], timestamp: 0, ttl: 30 * 60 * 1000 };
-let primeRetryMs = 15 * 60 * 1000; // backoff for re-priming after 429 (min 15m, max 4h)
+let primeRetryMs = 15 * 60 * 1000; // backoff after 429
 
 async function fetchMyTweetsRaw(count = 80) {
   try {
@@ -420,52 +359,42 @@ async function fetchMyTweetsRaw(count = 80) {
       userId = me.data.id;
       console.log('Got Twitter user ID:', userId);
     }
-
-    // Single-page fetch to avoid hammering rate limits
+    // Single page to avoid 429
     const paginator = await twitterClient.v2.userTimeline(userId, {
       max_results: Math.min(100, Math.max(20, count)),
       exclude: ['retweets', 'replies'],
-      'tweet.fields': ['created_at', 'text']
+      'tweet.fields': ['created_at','text']
     });
-
-    const texts = (paginator?.tweets || []).map(t => t?.text).filter(Boolean);
+    const texts = (paginator?.tweets || []).map(t=>t?.text).filter(Boolean);
     console.log(`Fetched ${texts.length} raw tweet(s) from timeline`);
     return texts;
-  } catch (error) {
-    console.error('fetchMyTweetsRaw failed:', error?.message || error);
-    if (error?.code === 429 || error?.status === 429) {
+  } catch (e) {
+    console.error('fetchMyTweetsRaw failed:', e?.message || e);
+    if (e?.code === 429 || e?.status === 429) {
       recentTweetsCache.timestamp = Date.now();
-      recentTweetsCache.ttl = Math.min(4 * 60 * 60 * 1000, primeRetryMs);
-      setTimeout(() => primePostedHashesFromTimeline(80), primeRetryMs);
-      primeRetryMs = Math.min(primeRetryMs * 2, 4 * 60 * 60 * 1000);
+      recentTweetsCache.ttl = Math.min(4*60*60*1000, primeRetryMs);
+      setTimeout(()=>primePostedHashesFromTimeline(80), primeRetryMs);
+      primeRetryMs = Math.min(primeRetryMs*2, 4*60*60*1000);
     }
     return [];
   }
 }
 
 async function getRecentTweets(count = 20) {
-  // Use cache if fresh
-  if (recentTweetsCache.tweets?.length > 0 &&
-      (Date.now() - recentTweetsCache.timestamp) < recentTweetsCache.ttl) {
+  if (recentTweetsCache.tweets?.length>0 && (Date.now()-recentTweetsCache.timestamp)<recentTweetsCache.ttl) {
     if (DEBUG_STATS) console.log('Using cached recent tweets');
     return recentTweetsCache.tweets;
   }
-
   const raw = await fetchMyTweetsRaw(count);
-  let cleaned = raw
-    .map(t => t.replace(/https?:\/\/\S+/g, '').replace(/@\w+/g, '').replace(/#(\w+)/g, '$1').replace(/\s+/g, ' ').trim())
-    .filter(t => t.length > 10);
-
-  // Fallback to local tweetLog if Twitter is empty/429
-  if (cleaned.length === 0 && tweetLog.length > 0) {
+  let cleaned = raw.map(t => t.replace(/https?:\/\/\S+/g,'').replace(/@\w+/g,'').replace(/#(\w+)/g,'$1').replace(/\s+/g,' ').trim())
+                   .filter(t => t.length>10);
+  if (cleaned.length===0 && tweetLog.length>0) {
     const src = tweetLog.slice(-count);
-    cleaned = src
-      .map(t => t.replace(/https?:\/\/\S+/g, '').replace(/@\w+/g, '').replace(/#(\w+)/g, '$1').replace(/\s+/g, ' ').trim())
-      .filter(t => t.length > 10);
+    cleaned = src.map(t => t.replace(/https?:\/\/\S+/g,'').replace(/@\w+/g,'').replace(/#(\w+)/g,'$1').replace(/\s+/g,' ').trim())
+                 .filter(t => t.length>10);
     console.log(`Using ${cleaned.length} entries from local tweet log for similarity checks`);
   }
-
-  if (cleaned.length > 0) {
+  if (cleaned.length>0) {
     recentTweetsCache = { tweets: cleaned, timestamp: Date.now(), ttl: recentTweetsCache.ttl };
     console.log(`Cached ${cleaned.length} cleaned tweet(s) for similarity checks`);
   } else {
@@ -474,43 +403,37 @@ async function getRecentTweets(count = 20) {
   return cleaned;
 }
 
-// Seed postedHashes from Twitter OR local tweet log (works even under 429)
-async function primePostedHashesFromTimeline(seedCount = 80) {
+async function primePostedHashesFromTimeline(seedCount=80) {
   try {
-    const rawTweets = await fetchMyTweetsRaw(seedCount);
+    const raw = await fetchMyTweetsRaw(seedCount);
     let added = 0;
-    // Prefer Twitter if available
-    if (rawTweets.length > 0) {
-      for (const t of rawTweets.reverse()) {
+    if (raw.length>0) {
+      for (const t of raw.reverse()) {
         const finalText = safeTrimTweet(t, 280);
         const h = hashTweet(finalText);
         if (!postedHashes.has(h)) { postedHashes.add(h); added++; }
       }
-      if (added > 0) await saveHashes();
+      if (added>0) await saveHashes();
       console.log(`Primed ${added} hash(es) from Twitter timeline`);
       primeRetryMs = 15 * 60 * 1000;
       return;
     }
-
-    // Fallback: prime from local tweet log
-    if (tweetLog.length > 0) {
+    // Fallback to local log
+    if (tweetLog.length>0) {
       for (const t of tweetLog.slice(-seedCount)) {
         const finalText = safeTrimTweet(t, 280);
         const h = hashTweet(finalText);
         if (!postedHashes.has(h)) { postedHashes.add(h); added++; }
       }
-      if (added > 0) await saveHashes();
+      if (added>0) await saveHashes();
       console.log(`Primed ${added} hash(es) from local tweet log`);
     } else {
       console.log('Priming found nothing (no Twitter access, no local log yet)');
     }
-  } catch (e) {
-    console.error('Failed to prime posted hashes:', e?.message || e);
-  }
+  } catch(e){ console.error('Failed to prime posted hashes:', e?.message || e); }
 }
 
-// ---------- Similarity checks ----------
-function detectStructuralSimilarity(text1, text2) {
+function detectStructuralSimilarity(a,b){
   const patterns = [
     /with a tvl of.*?and.*?apy of/i,
     /don't (let|miss) this opportunity/i,
@@ -519,295 +442,224 @@ function detectStructuralSimilarity(text1, text2) {
     /enhance your.*?today/i,
     /ready to.*?\?.*?with.*?tvl/i
   ];
-  let match = 0;
-  for (const p of patterns) if (p.test(text1) && p.test(text2)) match++;
-  return match >= 2;
+  let m=0; for (const p of patterns) if (p.test(a)&&p.test(b)) m++;
+  return m>=2;
 }
-async function isTwitterSimilar(newTweet, recentTweets, threshold = 0.35) {
-  const cleanNew = (newTweet || '').replace(/https?:\/\/\S+/g, '').replace(/@\w+/g, '').replace(/#/g, '').trim().toLowerCase();
-  for (const recent of recentTweets || []) {
+async function isTwitterSimilar(newTweet, recentTweets, threshold=0.35){
+  const cleanNew = (newTweet||'').replace(/https?:\/\/\S+/g,'').replace(/@\w+/g,'').replace(/#/g,'').trim().toLowerCase();
+  for (const recent of recentTweets||[]) {
     if (!recent) continue;
     const cleanOld = recent.toLowerCase();
     if (detectStructuralSimilarity(cleanNew, cleanOld)) return true;
-    const words1 = new Set(cleanNew.match(/\b\w+\b/g) || []);
-    const words2 = new Set(cleanOld.match(/\b\w+\b/g) || []);
-    if (words1.size < 3 || words2.size < 3) continue;
-    const inter = new Set([...words1].filter(x => words2.has(x)));
-    const uni   = new Set([...words1, ...words2]);
+    const w1 = new Set(cleanNew.match(/\b\w+\b/g) || []), w2 = new Set(cleanOld.match(/\b\w+\b/g) || []);
+    if (w1.size<3 || w2.size<3) continue;
+    const inter = new Set([...w1].filter(x=>w2.has(x)));
+    const uni   = new Set([...w1, ...w2]);
     const sim   = inter.size / uni.size;
     if (sim > threshold) return true;
   }
   return false;
 }
-
-// Optional deep check (GPT-5 ok via wrapper)
 async function checkWithOpenAI(newTweet, recentTweets) {
   if (!STRICT_ORIGINALITY || !OPENAI_ENABLED) return false;
-  const prompt = `Analyze if this new tweet is too similar to recent tweets.
+  const prompt = `Is this new tweet too similar/formulaic vs the recents?
 
-New tweet:
+New:
 "${newTweet}"
 
-Recent tweets:
-${(recentTweets || []).map((t,i)=>`${i+1}. "${t}"`).join('\n')}
+Recents:
+${(recentTweets||[]).map((t,i)=>`${i+1}. "${t}"`).join('\n')}
 
-Respond only "YES" if too similar/formulaic, or "NO" if sufficiently different.`;
+Reply "YES" if too similar, otherwise "NO".`;
   try {
     const resp = await chatOnce({ prompt, max: 50 });
-    const content = extractOpenAIText(resp);
-    const verdict = (content || '').trim().toUpperCase();
+    const verdict = extractOpenAIText(resp).trim().toUpperCase();
     return verdict.includes('YES');
-  } catch (e) {
-    console.error('OpenAI similarity check failed:', e?.message || e);
-    return false;
-  }
+  } catch { return false; }
 }
 
-// ---------- Builders ----------
-const usedFallbacksThisRun = new Set();
+/* ============================== Local unique generator ================== */
+function localUniqueTweet({ topic, mode='protocol' }) {
+  const templates = mode==='protocol'
+    ? [
+        `Did you know: ${topic}. Liquidity without waiting.`,
+        `${topic}. Keep voting power, keep optionality.`,
+        `${topic}. Liquid wrapper solves the unlock problem.`,
+        `${topic}. Design > promises.`,
+        `${topic}. Compounding works better when you can exit.`
+      ]
+    : [
+        `gm ser — ${topic} is back on the menu. Manage risk.`,
+        `${topic} again? touch grass, then rebalance.`,
+        `hot take: ${topic} needs fewer slogans, more product.`,
+        `anon, ${topic} alpha isn’t on the timeline.`,
+        `${topic}. ngmi if you ignore the fees.`
+      ];
+  // Try a handful of unique variants
+  for (let i=0;i<24;i++){
+    const t = safeTrimTweet(pick(templates), 280);
+    const h = hashTweet(t);
+    if (!postedHashes.has(h) && !tweetLog.includes(t)) return t;
+  }
+  // Last-resort: tiny nonce to change hash but keep semantics
+  const base = safeTrimTweet(pick(templates), 277);
+  return `${base} ·.`; // two char salt
+}
 
-async function generateProtocolTweet(maxAttempts = 5) {
+/* ============================== Builders ================================ */
+async function generateProtocolTweet(maxAttempts=5) {
   const recentTweets = await getRecentTweets();
-  const triedStyles  = new Set();
+  const tried = new Set();
 
-  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+  for (let attempt=0; attempt<maxAttempts; attempt++) {
     const stats = await getProtocolStats();
     if (!stats || stats.tvl === '0') { console.warn('Invalid stats; skip'); return null; }
 
-    const availableTopics = PROTOCOL_TOPICS.filter(t => !isTopicOnCooldown(t));
-    const topicsPool = availableTopics.length ? availableTopics : PROTOCOL_TOPICS;
-    const topic = topicsPool[Math.floor(Math.random()*topicsPool.length)];
+    const topicsAvail = PROTOCOL_TOPICS.filter(t=>!isTopicOnCooldown(t));
+    const topic = (topicsAvail.length ? topicsAvail : PROTOCOL_TOPICS)[Math.floor(Math.random()* (topicsAvail.length||PROTOCOL_TOPICS.length))];
     markTopicUsed(topic);
 
-    const styles = [
-      'educational','comparison','question','announcement','thread_starter',
-      'stat_highlight','feature_focus','user_story','myth_buster','tip','observation','analogy'
-    ].filter(s => !triedStyles.has(s));
-    const style = (styles.length ? styles : ['educational'])[Math.floor(Math.random()*Math.max(styles.length,1))];
-    triedStyles.add(style);
+    const styles = ['educational','comparison','question','announcement','thread_starter','stat_highlight','feature_focus','user_story','myth_buster','tip','observation','analogy']
+      .filter(s=>!tried.has(s));
+    const style = (styles.length?styles:['educational'])[Math.floor(Math.random()*Math.max(styles.length,1))];
+    tried.add(style);
 
-    const includeStats = Math.random() < 0.3;
-    const docsContent  = await fetchGitBookContent();
-    const docsContext  = docsContent || getDocumentationContext().keyFacts.join('\n');
+    const includeStats = Math.random()<0.3;
+    const docs = await fetchGitBookContent();
+    const docsCtx = docs || docsContext();
 
-    const statsContext = includeStats
+    const statsCtx = includeStats
       ? `\nCurrent stats (weave naturally; no "with TVL of X and APY of Y"):
 TVL ${stats.tvl}, APY ${stats.apy}%, AERO locked ${stats.aeroLocked}, iAERO/AERO ${stats.iAeroPeg}`
       : '\nDo not include specific stats in this tweet.';
 
-    const recentContext = (recentTweets?.length || 0) > 0
-      ? `\n\nRecent tweets to avoid copying:\n${recentTweets.slice(0, 8).join('\n---\n')}`
+    const recentCtx = (recentTweets?.length||0)>0
+      ? `\n\nRecent tweets to avoid copying:\n${recentTweets.slice(0,8).join('\n---\n')}`
       : '';
 
-    const styleGuides = {
-      educational: 'Teach something specific. Start with "Did you know" or "TIL".',
-      comparison: 'Compare iAERO to traditional locking without stats. Focus on UX.',
-      question: 'Ask an engaging question. No CTA.',
-      announcement: 'Sound like news/update. Active voice.',
-      thread_starter: 'Write like a thread starter. End with "A thread 🧵" or "Let me explain 👇".',
-      stat_highlight: 'Lead with ONE number; tell a story around it.',
-      feature_focus: 'Deep dive on ONE feature. Technical but accessible.',
-      user_story: 'Write from a user POV. Make it specific.',
-      myth_buster: 'Myth vs Reality; be direct.',
-      tip: 'One actionable tip. Start with "Pro tip:"',
-      observation: 'Thoughtful observation about DeFi/protocol.',
-      analogy: 'Creative analogy that makes it memorable.'
-    };
-
     const prompt = `Based on iAERO docs:
-${docsContext}
+${docsCtx}
 
-Create a ${style} style tweet about: ${topic}
+Create a ${style} tweet about: ${topic}
+Guidance: Be specific, no [generic + stats + CTA].
+Forbidden: "with a TVL of", "and APY of", "don't miss this opportunity", "join us today", "dive into", "enhance your", "ready to".
+Max one hashtag, optional.
+${statsCtx}
+${recentCtx}
+Under 280 chars.`;
 
-Style guide: ${styleGuides[style] || 'Be creative and original.'}
-${statsContext}
-${recentContext}
-
-CRITICAL:
-- Under 280 chars
-- MUST differ in structure/tone from the recents
-- FORBIDDEN: "with a TVL of", "and APY of", "don't miss this opportunity", "join us today", "dive into", "enhance your", "ready to"
-- Avoid [generic statement] + [stats] + [CTA]
-- Max 1 hashtag; vary it
-- Sound human; have an opinion`;
-
+    let generated = '';
     try {
       const resp = await chatOnce({ prompt, max: 220 });
-      let generated = extractOpenAIText(resp).trim();
-      if (!generated) { console.warn('Empty OpenAI content; retrying…'); continue; }
-
-      // Trim first, then hash
-      generated = safeTrimTweet(generated, 280);
-      const tweetHash = hashTweet(generated);
-      if (postedHashes.has(tweetHash)) { console.log(`Hash exists (attempt ${attempt+1}); regenerating…`); continue; }
-
-      const isSimilar = await isTwitterSimilar(generated, recentTweets, 0.35);
-      const failsDeep = STRICT_ORIGINALITY && !isSimilar && await checkWithOpenAI(generated, recentTweets.slice(0,10));
-
-      if (!isSimilar && !failsDeep) {
-        console.log(`Generated ${style} tweet on attempt ${attempt + 1}`);
-        return generated;
-      }
-      console.log(`Too similar (${style}, attempt ${attempt+1}); retrying…`);
-    } catch (error) {
-      console.error('OpenAI error (protocol tweet):', error?.message || error);
-      break;
+      generated = extractOpenAIText(resp).trim();
+    } catch (e) {
+      console.error('OpenAI error (protocol tweet):', e?.message || e);
     }
+    if (!generated) {
+      console.warn('OpenAI empty; using local generator');
+      generated = localUniqueTweet({ topic, mode:'protocol' });
+    }
+
+    generated = safeTrimTweet(generated, 280);
+    const h = hashTweet(generated);
+    if (postedHashes.has(h)) { console.log(`Hash exists (attempt ${attempt+1}); regenerating…`); continue; }
+
+    const tooSimilar = await isTwitterSimilar(generated, recentTweets, 0.35)
+      || (STRICT_ORIGINALITY && await checkWithOpenAI(generated, recentTweets.slice(0,10)));
+
+    if (!tooSimilar) {
+      console.log(`Generated ${style} tweet on attempt ${attempt+1}`);
+      return generated;
+    }
+    console.log(`Too similar (${style}, attempt ${attempt+1}); regenerating…`);
   }
 
-  // Fallbacks (avoid reusing within the same run)
-  const fallbacks = [
-    "Nobody:\nAbsolutely nobody:\nMe checking if my 4-year lock has expired yet: 🤡\n\n(this post made by iAERO gang)",
-    "Breaking: Area man discovers one weird trick to avoid 4-year lockups. ve(3,3) protocols hate him! 🗞️",
-    "gm to everyone except those still doing 4 year locks in 2025. Permanent lock + liquid token or ngmi 💀",
-    "Wife: why are his tokens free and yours locked till 2028?\nMe: there's this escrow—\nWife: *leaves with iAERO chad*",
-    "Year 2028: tokens unlock. iAERO holders: already traded, earned, collateralized. 📅",
-    "Therapist: Liquid permanent locks aren’t real.\niAERO: *exists*\nTraditional ve(3,3): 😰",
-    "Did you know? Every iAERO holder owns a piece of permanently locked veAERO. The lock never expires, but your tokens stay liquid. Best of both worlds.",
-    "Thread: Why permanent locks beat 4-year locks 🧵\n\n1) No re-lock cycles\n2) Tokens stay liquid\n3) Same voting power\n4) Exit anytime\n\nThat’s iAERO.",
-    "Fun fact: iAERO stakers earn fees while 4-year lockers wait for unlocks. Time in market > timing market.",
-    "0.95 iAERO per AERO locked. That 5% funds the liquid wrapper you can exit anytime. Fair trade.",
-    "Question for lockers: What if you need liquidity before 2028?\n\niAERO: “We can sell anytime.”",
-    "Myth: You must lock for max rewards.\nReality: iAERO earns the same with zero unlock date."
-  ];
-  for (const fb of fallbacks.sort(() => Math.random() - 0.5)) {
-    if (usedFallbacksThisRun.has(fb)) continue;
-    const trimmed = safeTrimTweet(fb, 280);
-    const h = hashTweet(trimmed);
-    if (!postedHashes.has(h) && !(await isTwitterSimilar(trimmed, recentTweets, 0.3))) {
-      usedFallbacksThisRun.add(fb);
-      console.log('Using creative fallback tweet'); return trimmed;
-    }
-  }
-  console.error('Could not generate unique tweet');
-  return null;
+  // If all attempts fail uniqueness, force unique local
+  const forced = localUniqueTweet({ topic: pick(PROTOCOL_TOPICS), mode:'protocol' });
+  console.log('Using forced-unique local protocol tweet');
+  return forced;
 }
 
-async function generateShitpost(maxAttempts = 4) {
+async function generateShitpost(maxAttempts=4) {
   const recentTweets = await getRecentTweets();
   const styles = ['meme_format','crypto_slang_heavy','fake_news_headline','hot_take','relatable_pain','chad_vs_virgin','year_2028_joke','wife_changing_money'];
 
-  for (let attempt = 0; attempt < maxAttempts; attempt++) {
-    const topic = SHITPOST_TOPICS[Math.floor(Math.random() * SHITPOST_TOPICS.length)];
-    const style = styles[Math.floor(Math.random() * styles.length)];
+  for (let attempt=0; attempt<maxAttempts; attempt++) {
+    const topic = pick(SHITPOST_TOPICS);
+    const style = pick(styles);
 
-    const recentContext = (recentTweets?.length || 0) > 0
-      ? `\n\nAvoid repeating themes/jokes from these:\n${recentTweets.slice(0, 5).join('\n')}` : '';
+    const recentCtx = (recentTweets?.length||0)>0
+      ? `\n\nAvoid repeating themes/jokes from these:\n${recentTweets.slice(0,5).join('\n')}` : '';
 
     const prompt = `Create a witty, crypto-native tweet about ${topic}.
-
 Style: ${style}
+Context hints (optional): liquid permanent locks; Base network; staker fee share.
+Rules: <280 chars, max 1 hashtag, no generic promo.
+${recentCtx}`;
 
-Context (use subtly if relevant):
-- Permanent locks with liquid tokens
-- No 4-year unlock waiting
-- Base network, low fees
-- 80% fee distribution to stakers
-${recentContext}
-
-Requirements:
-- Under 280 chars
-- Funny/relatable crypto slang (gm, ser, anon, ngmi, wagmi)
-- Subtle iAERO tie-in if relevant
-- Max 1 hashtag
-- Must be original and different from recent tweets
-- Avoid generic promo`;
-
+    let generated = '';
     try {
-      const resp = await chatOnce({ prompt, max: 220 });
-      let generated = extractOpenAIText(resp).trim();
-      if (!generated) { console.warn('Empty OpenAI content; retrying…'); continue; }
-
-      generated = safeTrimTweet(generated, 280);
-      const tweetHash = hashTweet(generated);
-      if (postedHashes.has(tweetHash)) { console.log(`Shitpost hash exists (attempt ${attempt+1}); regenerating…`); continue; }
-
-      const isSimilar = await isTwitterSimilar(generated, recentTweets, 0.30);
-      if (!isSimilar) {
-        console.log(`Generated original shitpost (${style}) on attempt ${attempt+1}`);
-        return generated;
-      }
-      console.log(`Shitpost too similar (attempt ${attempt+1}); regenerating…`);
-    } catch (error) {
-      console.error('OpenAI error (shitpost):', error?.message || error);
-      break;
+      const resp = await chatOnce({ prompt, max: 200 });
+      generated = extractOpenAIText(resp).trim();
+    } catch (e) {
+      console.error('OpenAI error (shitpost):', e?.message || e);
     }
+    if (!generated) {
+      console.warn('OpenAI empty; using local generator (shitpost)');
+      generated = localUniqueTweet({ topic, mode:'shitpost' });
+    }
+
+    generated = safeTrimTweet(generated, 280);
+    const h = hashTweet(generated);
+    if (postedHashes.has(h)) { console.log(`Shitpost hash exists (attempt ${attempt+1}); regenerating…`); continue; }
+
+    const similar = await isTwitterSimilar(generated, recentTweets, 0.30);
+    if (!similar) {
+      console.log(`Generated original shitpost (${style}) on attempt ${attempt+1}`);
+      return generated;
+    }
+    console.log(`Shitpost too similar (attempt ${attempt+1}); regenerating…`);
   }
 
-  // Diverse fallback shitposts
-  const fallbacks = [
-    "Nobody:\nAbsolutely nobody:\nMe checking if my 4-year lock has expired yet: 🤡\n\n(this post made by iAERO gang)",
-    "Breaking: Area man discovers one weird trick to avoid 4-year lockups. ve(3,3) protocols hate him! 🗞️",
-    "gm to everyone except those still doing 4 year locks in 2025. Permanent lock + liquid token or ngmi 💀",
-    "Wife: why are his tokens free and yours locked till 2028?\nMe: there's this escrow—\nWife: *leaves with iAERO chad*",
-    "Year 2028: tokens unlock. iAERO holders: already traded, earned, collateralized. 📅",
-    "Therapist: Liquid permanent locks aren’t real.\niAERO: *exists*\nTraditional ve(3,3): 😰"
-  ];
-  for (const fb of fallbacks.sort(() => Math.random() - 0.5)) {
-    if (usedFallbacksThisRun.has(fb)) continue;
-    const trimmed = safeTrimTweet(fb, 280);
-    const h = hashTweet(trimmed);
-    if (!postedHashes.has(h) && !(await isTwitterSimilar(trimmed, recentTweets, 0.35))) {
-      usedFallbacksThisRun.add(fb);
-      console.log('Using fallback shitpost'); return trimmed;
-    }
-  }
-  console.error('Could not generate unique shitpost; skipping');
-  return null;
+  const forced = localUniqueTweet({ topic: pick(SHITPOST_TOPICS), mode:'shitpost' });
+  console.log('Using forced-unique local shitpost');
+  return forced;
 }
 
-// ---------- Duplicate error detection ----------
+/* ============================== Posting & schedule ====================== */
 function isDuplicateTweetError(err) {
   const msg = (err?.data?.detail || err?.data?.title || err?.message || '').toLowerCase();
-  const codes = new Set((err?.data?.errors || []).map(e => e?.code));
-  return (
-    err?.code === 403 ||
-    err?.status === 403 ||
-    msg.includes('duplicate') ||
-    msg.includes('already posted') ||
-    codes.has?.(186) ||
-    codes.has?.(187)
-  );
+  const codes = new Set((err?.data?.errors || []).map(e=>e?.code));
+  return err?.code===403 || err?.status===403 || msg.includes('duplicate') || msg.includes('already posted') || codes.has?.(186) || codes.has?.(187);
 }
 
-// ---------- Posting loop ----------
-async function postTweet(retries = 2) {
-  let lastError = null;
-  for (let i = 0; i <= retries; i++) {
-    let content = null;
-    try {
-      const isProtocolTweet = Math.random() < 0.7;
-      content = isProtocolTweet ? await generateProtocolTweet() : await generateShitpost();
+async function postTweet(retries=2) {
+  let lastError=null;
+  for (let i=0;i<=retries;i++){
+    let content=null;
+    try{
+      const isProtocol = Math.random() < 0.7;
+      content = isProtocol ? await generateProtocolTweet() : await generateShitpost();
+      if (!content) { console.log('No tweet content generated; skip'); return null; }
 
-      if (!content) { console.log('No tweet content generated; skip this cycle'); return null; }
-
-      // TRIM FIRST, THEN HASH (so local and remote hashes match)
-      content = safeTrimTweet(content, 280);
-      const tweetHash = hashTweet(content);
-
-      if (postedHashes.has(tweetHash)) {
-        console.log('Hash collision pre-post (already tweeted this exact text); regenerating…');
-        continue;
-      }
+      content = safeTrimTweet(content, 280); // TRIM FIRST
+      const h = hashTweet(content);
+      if (postedHashes.has(h)) { console.log('Hash collision pre-post; regenerating…'); continue; }
 
       console.log(`[${new Date().toISOString()}] Posting tweet:`, content);
+      const tw = await twitterClient.v2.tweet(content);
+      console.log('Tweet posted successfully:', tw?.data?.id);
 
-      const tweet = await twitterClient.v2.tweet(content);
-      console.log('Tweet posted successfully:', tweet?.data?.id);
-
-      // Record success in hash and local tweet log
-      postedHashes.add(tweetHash);
+      postedHashes.add(h);
       tweetLog.push(content);
-      if (tweetLog.length > 500) tweetLog = tweetLog.slice(-500);
+      if (tweetLog.length>500) tweetLog = tweetLog.slice(-500);
       await Promise.all([saveHashes(), saveTweetLog()]);
 
-      return tweet;
-    } catch (error) {
-      lastError = error;
-      console.error(`Failed to post tweet (attempt ${i + 1}/${retries + 1}):`, error?.message || error);
-
-      // If Twitter says it's a duplicate, record the hash so we don't try again.
-      if (content && isDuplicateTweetError(error)) {
+      return tw;
+    } catch(e){
+      lastError=e;
+      console.error(`Failed to post tweet (attempt ${i+1}/${retries+1}):`, e?.message || e);
+      if (content && isDuplicateTweetError(e)) {
         const h = hashTweet(safeTrimTweet(content, 280));
         if (!postedHashes.has(h)) {
           console.log('Marking duplicate tweet hash to avoid future attempts');
@@ -815,15 +667,11 @@ async function postTweet(retries = 2) {
           await saveHashes();
         }
       }
-
-      if (error?.code === 429 || error?.status === 429) {
-        console.log('Rate limited; stopping retries to avoid ban');
-        break;
-      }
-      if (i < retries) {
-        const wait = Math.min(1000 * Math.pow(2, i), 10000);
+      if (e?.code===429 || e?.status===429) { console.log('Rate limited; stopping retries'); break; }
+      if (i<retries){
+        const wait = Math.min(1000*(2**i), 10000);
         console.log(`Waiting ${wait}ms before retry…`);
-        await new Promise(r => setTimeout(r, wait));
+        await new Promise(r=>setTimeout(r, wait));
       }
     }
   }
@@ -831,21 +679,23 @@ async function postTweet(retries = 2) {
   return null;
 }
 
-function getRandomIntervalMinutes() {
-  return Math.floor(Math.random() * (360 - 240 + 1) + 240); // 4–6 hours
+function getRandomIntervalMinutes(){
+  const min = Number(process.env.TWEET_MIN_MINUTES || 240);
+  const max = Number(process.env.TWEET_MAX_MINUTES || 360);
+  return Math.floor(Math.random()*(max-min+1)+min);
 }
-function scheduleNextTweet() {
+function scheduleNextTweet(){
   const minutes = getRandomIntervalMinutes();
-  const ms = minutes * 60 * 1000;
-  console.log(`Next tweet in ${minutes} minutes (${(minutes / 60).toFixed(1)} hours)`);
-  setTimeout(async () => {
+  const ms = minutes*60*1000;
+  console.log(`Next tweet in ${minutes} minutes (${(minutes/60).toFixed(1)} hours)`);
+  setTimeout(async()=>{
     await postTweet();
     scheduleNextTweet();
   }, ms);
 }
 
-// ---------- Bootstrap ----------
-async function startBot() {
+/* ============================== Bootstrap =============================== */
+async function startBot(){
   console.log('🤖 iAERO Twitter Bot starting (Production Version)…');
   console.log('Environment:', {
     platform: process.env.RAILWAY_ENVIRONMENT || 'local',
@@ -864,7 +714,7 @@ async function startBot() {
   await initDataFiles();
   await loadHashes();
   await loadTweetLog();
-  await primePostedHashesFromTimeline(80); // Will fall back to local log if 429
+  await primePostedHashesFromTimeline(80);
 
   console.log('Initializing stats cache…');
   const testStats = await getProtocolStats(true);
@@ -872,18 +722,14 @@ async function startBot() {
 
   await fetchGitBookContent();
 
-  try {
-    console.log('Loading recent tweet history…');
-    await getRecentTweets();
-  } catch (e) {
-    console.error('Could not load tweet history on startup:', e?.message || e);
-  }
+  try { console.log('Loading recent tweet history…'); await getRecentTweets(); }
+  catch(e){ console.error('Could not load tweet history on startup:', e?.message || e); }
 
   if (testStats && testStats.tvl !== '0') {
-    if (!recentTweetsCache.tweets || recentTweetsCache.tweets.length === 0) {
-      const jitter = 5 + Math.floor(Math.random()*10); // 5–15 min
+    if (!recentTweetsCache.tweets || recentTweetsCache.tweets.length===0) {
+      const jitter = 5 + Math.floor(Math.random()*10);
       console.log(`Rate limited or empty cache; waiting ${jitter} minutes before first tweet…`);
-      await new Promise(r => setTimeout(r, jitter * 60 * 1000));
+      await new Promise(r=>setTimeout(r, jitter*60*1000));
       try { await getRecentTweets(); } catch {}
     }
     await postTweet();
@@ -895,8 +741,8 @@ async function startBot() {
   scheduleNextTweet();
   console.log('Scheduler registered.');
 
-  // Periodic re-priming from timeline (helps after transient 429s or container restarts)
-  setInterval(() => primePostedHashesFromTimeline(80), 3 * 60 * 60 * 1000);
+  // Periodic timeline priming (helps after transient 429s)
+  setInterval(()=>primePostedHashesFromTimeline(80), 3 * 60 * 60 * 1000);
 
   // Daily stats at 14:00 UTC (idempotent)
   cron.schedule('0 14 * * *', async () => {
@@ -917,20 +763,16 @@ Prices:
 • iAERO/AERO: ${stats.iAeroPeg}
 
 Lock. Stake. Earn. Stay liquid.`;
-
       statsTweet = safeTrimTweet(statsTweet, 280);
       const h = hashTweet(statsTweet);
-      if (postedHashes.has(h)) {
-        console.log('Daily stats tweet is identical to a previous one; skipping');
-        return;
-      }
+      if (postedHashes.has(h)) { console.log('Daily stats tweet identical; skipping'); return; }
 
       try {
         const tw = await twitterClient.v2.tweet(statsTweet);
         console.log('Daily stats tweet posted:', tw?.data?.id);
         postedHashes.add(h);
         tweetLog.push(statsTweet);
-        if (tweetLog.length > 500) tweetLog = tweetLog.slice(-500);
+        if (tweetLog.length>500) tweetLog = tweetLog.slice(-500);
         await Promise.all([saveHashes(), saveTweetLog()]);
       } catch (err) {
         console.error('Failed to post daily stats:', err?.message || err);
@@ -942,48 +784,31 @@ Lock. Stake. Earn. Stay liquid.`;
     }
   });
 
-  // Stats refresh
-  setInterval(async () => {
+  // Stats refresh loop
+  setInterval(async ()=>{
     if (DEBUG_STATS) console.log('Refreshing stats cache…');
-    try { await getProtocolStats(true); } catch (e) { console.error('Stats refresh failed:', e?.message || e); }
-  }, 5 * 60 * 1000);
+    try { await getProtocolStats(true); } catch(e){ console.error('Stats refresh failed:', e?.message || e); }
+  }, 5*60*1000);
 
-  // Hash save + memory
-  setInterval(async () => {
+  // Periodic persistence & mem stats
+  setInterval(async ()=>{
     await Promise.all([saveHashes(), saveTweetLog()]);
-    const usage = process.memoryUsage();
+    const u = process.memoryUsage();
     console.log('Memory usage:', {
-      rss: `${Math.round(usage.rss/1024/1024)}MB`,
-      heap: `${Math.round(usage.heapUsed/1024/1024)}MB / ${Math.round(usage.heapTotal/1024/1024)}MB`,
-      external: `${Math.round(usage.external/1024/1024)}MB`,
+      rss: `${Math.round(u.rss/1024/1024)}MB`,
+      heap: `${Math.round(u.heapUsed/1024/1024)}MB / ${Math.round(u.heapTotal/1024/1024)}MB`,
+      external: `${Math.round(u.external/1024/1024)}MB`,
       hashCount: postedHashes.size,
       topicCooldowns: topicCooldowns.size,
       tweetLogCount: tweetLog.length
     });
-  }, 30 * 60 * 1000);
+  }, 30*60*1000);
 }
 
-process.on('unhandledRejection', err => {
-  console.error('Unhandled rejection:', err);
-});
-process.on('uncaughtException', async err => {
-  console.error('Uncaught exception:', err);
-  await Promise.allSettled([saveHashes(), saveTweetLog()]);
-  process.exit(1);
-});
-process.on('SIGTERM', async () => {
-  console.log('SIGTERM: saving state, shutting down gracefully…');
-  await Promise.allSettled([saveHashes(), saveTweetLog()]);
-  process.exit(0);
-});
-process.on('SIGINT', async () => {
-  console.log('SIGINT: saving state, shutting down gracefully…');
-  await Promise.allSettled([saveHashes(), saveTweetLog()]);
-  process.exit(0);
-});
+/* ============================== Crash safety ============================ */
+process.on('unhandledRejection', err => { console.error('Unhandled rejection:', err); });
+process.on('uncaughtException', async err => { console.error('Uncaught exception:', err); await Promise.allSettled([saveHashes(), saveTweetLog()]); process.exit(1); });
+process.on('SIGTERM', async ()=>{ console.log('SIGTERM: saving state…'); await Promise.allSettled([saveHashes(), saveTweetLog()]); process.exit(0); });
+process.on('SIGINT',  async ()=>{ console.log('SIGINT: saving state…');  await Promise.allSettled([saveHashes(), saveTweetLog()]); process.exit(0); });
 
-startBot().catch(async err => {
-  console.error('Failed to start bot:', err);
-  await Promise.allSettled([saveHashes(), saveTweetLog()]);
-  process.exit(1);
-});
+startBot().catch(async err => { console.error('Failed to start bot:', err); await Promise.allSettled([saveHashes(), saveTweetLog()]); process.exit(1); });

@@ -1,4 +1,4 @@
-// twitter-bot.mjs — Production version with GPT-5 wrapper, rate-limit-safe timeline, 403-aware dedupe
+// twitter-bot.mjs — Production version with GPT-5 wrapper, local tweet-log persistence, 403-aware dedupe
 import 'dotenv/config';
 import { TwitterApi } from 'twitter-api-v2';
 import OpenAI from 'openai';
@@ -39,38 +39,26 @@ const OPENAI_MODEL       = process.env.OPENAI_MODEL || 'gpt-5-mini';
 const isGpt5Family       = OPENAI_MODEL.startsWith('gpt-5');
 const STRICT_ORIGINALITY = OPENAI_ENABLED && process.env.STRICT_ORIGINALITY === '1';
 
-// ---------- OpenAI wrapper (fix: use max_tokens and robust extraction) ----------
+// ---------- OpenAI wrapper (use max_tokens + robust extraction) ----------
 function extractOpenAIText(resp) {
-  // Try the standard string first
   const msg = resp?.choices?.[0]?.message;
   if (!msg) return '';
   if (typeof msg.content === 'string') return msg.content;
-  // Some SDKs return content as an array of segments
   if (Array.isArray(msg.content)) {
-    return msg.content.map(part => {
-      if (typeof part === 'string') return part;
-      if (typeof part?.text === 'string') return part.text;
-      return '';
-    }).join('');
+    return msg.content.map(p => (typeof p === 'string' ? p : (p?.text || ''))).join('');
   }
   return '';
 }
-
-/**
- * chatOnce: returns the full response (to keep call sites simple),
- * but we ALWAYS set max_tokens and rely on extractOpenAIText for content.
- */
-async function chatOnce({ prompt, max = 500, legacyTuning }) {
+async function chatOnce({ prompt, max = 220, legacyTuning }) {
   const base = { model: OPENAI_MODEL, messages: [{ role: 'user', content: prompt }] };
   const legacy = legacyTuning || { temperature: 0.9, presence_penalty: 0.6, frequency_penalty: 0.6 };
 
   if (isGpt5Family) {
-    // IMPORTANT: chat.completions expects max_tokens
-    return openai.chat.completions.create({ ...base, max_completion_tokens: max });
+    return openai.chat.completions.create({ ...base, max_tokens: max });
   }
   return openai.chat.completions.create({
     ...base,
-    max_completion_tokens: max,
+    max_tokens: max,
     temperature: legacy.temperature,
     presence_penalty: legacy.presence_penalty,
     frequency_penalty: legacy.frequency_penalty
@@ -83,8 +71,40 @@ const provider = new ethers.JsonRpcProvider(process.env.RPC_URL || 'https://main
 // ---------- Stats cache ----------
 let statsCache = { data: null, timestamp: 0, ttl: 5 * 60 * 1000 };
 
+// ---------- Data dir + persistence (hashes + tweet log) ----------
+let DATA_DIR = null;
+let HASH_FILE = null;
+let TWEET_LOG_FILE = null;
+
+async function initDataFiles() {
+  const candidates = [
+    process.env.DATA_DIR,
+    '/data',
+    '/var/data',
+    '/mnt/data',
+    path.join(__dirname, 'data')
+  ].filter(Boolean);
+
+  for (const dir of candidates) {
+    try {
+      await fs.mkdir(dir, { recursive: true });
+      const testFile = path.join(dir, '.rwtest');
+      await fs.writeFile(testFile, 'ok');
+      await fs.unlink(testFile);
+      DATA_DIR = dir;
+      break;
+    } catch {}
+  }
+  if (!DATA_DIR) DATA_DIR = path.join(__dirname, 'data');
+  await fs.mkdir(DATA_DIR, { recursive: true });
+
+  HASH_FILE = path.join(DATA_DIR, 'tweet-hashes.json');
+  TWEET_LOG_FILE = path.join(DATA_DIR, 'tweet-log.json');
+
+  console.log('Data directory set to:', DATA_DIR);
+}
+
 // ---------- Hash-based dedupe ----------
-const HASH_FILE = path.join(__dirname, 'tweet-hashes.json');
 let postedHashes = new Set();
 
 async function loadHashes() {
@@ -108,6 +128,29 @@ async function saveHashes() {
 function hashTweet(content) {
   const normalized = (content || '').trim().toLowerCase().replace(/\s+/g, ' ');
   return crypto.createHash('sha256').update(normalized).digest('hex').slice(0, 16);
+}
+
+// ---------- Local tweet log (exact trimmed text for similarity when 429) ----------
+let tweetLog = [];
+
+async function loadTweetLog() {
+  try {
+    const data = await fs.readFile(TWEET_LOG_FILE, 'utf8');
+    const arr = JSON.parse(data);
+    tweetLog = Array.isArray(arr) ? arr.filter(t => typeof t === 'string') : [];
+    console.log(`Loaded tweet log with ${tweetLog.length} entries`);
+  } catch {
+    console.log('No existing tweet log; starting fresh');
+    tweetLog = [];
+  }
+}
+async function saveTweetLog() {
+  try {
+    const last500 = tweetLog.slice(-500);
+    await fs.writeFile(TWEET_LOG_FILE, JSON.stringify(last500, null, 2), 'utf8');
+  } catch (err) {
+    console.error('Failed to save tweet log:', err?.message || err);
+  }
 }
 
 // ---------- Topic cooldowns ----------
@@ -276,7 +319,7 @@ async function fetchGitBookContent() {
 // ---------- On-chain stats with caching ----------
 async function getProtocolStats(forceRefresh = false) {
   if (!forceRefresh && statsCache.data && (Date.now() - statsCache.timestamp) < statsCache.ttl) {
-    console.log('Returning cached stats');
+    if (DEBUG_STATS) console.log('Returning cached stats');
     return statsCache.data;
   }
 
@@ -365,11 +408,11 @@ async function getProtocolStats(forceRefresh = false) {
   return stats;
 }
 
-// ---------- Recent tweets cache + SINGLE-PAGE fetch (rate-limit friendly) ----------
+// ---------- Recent tweets (prefer Twitter, fallback to local tweet log) ----------
 let recentTweetsCache = { tweets: [], timestamp: 0, ttl: 30 * 60 * 1000 };
 let primeRetryMs = 15 * 60 * 1000; // backoff for re-priming after 429 (min 15m, max 4h)
 
-async function fetchMyTweetsRaw(count = 100) {
+async function fetchMyTweetsRaw(count = 80) {
   try {
     let userId = process.env.TWITTER_USER_ID;
     if (!userId) {
@@ -378,54 +421,49 @@ async function fetchMyTweetsRaw(count = 100) {
       console.log('Got Twitter user ID:', userId);
     }
 
-    // Fetch ONLY ONE PAGE to avoid 429s.
+    // Single-page fetch to avoid hammering rate limits
     const paginator = await twitterClient.v2.userTimeline(userId, {
-      // 5..100; stay conservative to reduce payload
       max_results: Math.min(100, Math.max(20, count)),
       exclude: ['retweets', 'replies'],
       'tweet.fields': ['created_at', 'text']
     });
 
-    // twitter-api-v2 exposes first page tweets via `.tweets`
-    const texts = (paginator?.tweets || [])
-      .map(t => t?.text)
-      .filter(Boolean);
-
+    const texts = (paginator?.tweets || []).map(t => t?.text).filter(Boolean);
     console.log(`Fetched ${texts.length} raw tweet(s) from timeline`);
     return texts;
   } catch (error) {
     console.error('fetchMyTweetsRaw failed:', error?.message || error);
     if (error?.code === 429 || error?.status === 429) {
-      // Simple backoff: mark cache as "fresh" with empty to throttle retries
       recentTweetsCache.timestamp = Date.now();
       recentTweetsCache.ttl = Math.min(4 * 60 * 60 * 1000, primeRetryMs);
-      // Schedule a background re-prime attempt (non-fatal if process dies)
-      setTimeout(() => primePostedHashesFromTimeline(100), primeRetryMs);
+      setTimeout(() => primePostedHashesFromTimeline(80), primeRetryMs);
       primeRetryMs = Math.min(primeRetryMs * 2, 4 * 60 * 60 * 1000);
     }
     return [];
   }
 }
 
-// Cleaned tweets for similarity (kept separate from hashing)
 async function getRecentTweets(count = 20) {
+  // Use cache if fresh
   if (recentTweetsCache.tweets?.length > 0 &&
       (Date.now() - recentTweetsCache.timestamp) < recentTweetsCache.ttl) {
-    console.log('Using cached recent tweets');
+    if (DEBUG_STATS) console.log('Using cached recent tweets');
     return recentTweetsCache.tweets;
   }
 
   const raw = await fetchMyTweetsRaw(count);
-  const cleaned = raw
-    .map(t =>
-      t
-        .replace(/https?:\/\/\S+/g, '')  // remove links
-        .replace(/@\w+/g, '')            // remove mentions
-        .replace(/#(\w+)/g, '$1')        // drop '#' but keep the word
-        .replace(/\s+/g, ' ')
-        .trim()
-    )
+  let cleaned = raw
+    .map(t => t.replace(/https?:\/\/\S+/g, '').replace(/@\w+/g, '').replace(/#(\w+)/g, '$1').replace(/\s+/g, ' ').trim())
     .filter(t => t.length > 10);
+
+  // Fallback to local tweetLog if Twitter is empty/429
+  if (cleaned.length === 0 && tweetLog.length > 0) {
+    const src = tweetLog.slice(-count);
+    cleaned = src
+      .map(t => t.replace(/https?:\/\/\S+/g, '').replace(/@\w+/g, '').replace(/#(\w+)/g, '$1').replace(/\s+/g, ' ').trim())
+      .filter(t => t.length > 10);
+    console.log(`Using ${cleaned.length} entries from local tweet log for similarity checks`);
+  }
 
   if (cleaned.length > 0) {
     recentTweetsCache = { tweets: cleaned, timestamp: Date.now(), ttl: recentTweetsCache.ttl };
@@ -436,25 +474,35 @@ async function getRecentTweets(count = 20) {
   return cleaned;
 }
 
-// Seed postedHashes from the live timeline; if 429, we retry later automatically
-async function primePostedHashesFromTimeline(seedCount = 100) {
+// Seed postedHashes from Twitter OR local tweet log (works even under 429)
+async function primePostedHashesFromTimeline(seedCount = 80) {
   try {
     const rawTweets = await fetchMyTweetsRaw(seedCount);
     let added = 0;
-    for (const t of rawTweets.reverse()) { // oldest -> newest
-      const finalText = safeTrimTweet(t, 280);
-      const h = hashTweet(finalText);
-      if (!postedHashes.has(h)) {
-        postedHashes.add(h);
-        added++;
+    // Prefer Twitter if available
+    if (rawTweets.length > 0) {
+      for (const t of rawTweets.reverse()) {
+        const finalText = safeTrimTweet(t, 280);
+        const h = hashTweet(finalText);
+        if (!postedHashes.has(h)) { postedHashes.add(h); added++; }
       }
+      if (added > 0) await saveHashes();
+      console.log(`Primed ${added} hash(es) from Twitter timeline`);
+      primeRetryMs = 15 * 60 * 1000;
+      return;
     }
-    if (added > 0) {
-      await saveHashes();
-      console.log(`Primed ${added} hash(es) from existing timeline`);
-      primeRetryMs = 15 * 60 * 1000; // reset backoff after success
+
+    // Fallback: prime from local tweet log
+    if (tweetLog.length > 0) {
+      for (const t of tweetLog.slice(-seedCount)) {
+        const finalText = safeTrimTweet(t, 280);
+        const h = hashTweet(finalText);
+        if (!postedHashes.has(h)) { postedHashes.add(h); added++; }
+      }
+      if (added > 0) await saveHashes();
+      console.log(`Primed ${added} hash(es) from local tweet log`);
     } else {
-      console.log('Priming found 0 new hashes (maybe already up to date)');
+      console.log('Priming found nothing (no Twitter access, no local log yet)');
     }
   } catch (e) {
     console.error('Failed to prime posted hashes:', e?.message || e);
@@ -472,9 +520,7 @@ function detectStructuralSimilarity(text1, text2) {
     /ready to.*?\?.*?with.*?tvl/i
   ];
   let match = 0;
-  for (const p of patterns) {
-    if (p.test(text1) && p.test(text2)) match++;
-  }
+  for (const p of patterns) if (p.test(text1) && p.test(text2)) match++;
   return match >= 2;
 }
 async function isTwitterSimilar(newTweet, recentTweets, threshold = 0.35) {
@@ -482,18 +528,14 @@ async function isTwitterSimilar(newTweet, recentTweets, threshold = 0.35) {
   for (const recent of recentTweets || []) {
     if (!recent) continue;
     const cleanOld = recent.toLowerCase();
-    if (detectStructuralSimilarity(cleanNew, cleanOld)) {
-      console.log('Tweet has similar structure to recent tweet'); return true;
-    }
+    if (detectStructuralSimilarity(cleanNew, cleanOld)) return true;
     const words1 = new Set(cleanNew.match(/\b\w+\b/g) || []);
     const words2 = new Set(cleanOld.match(/\b\w+\b/g) || []);
     if (words1.size < 3 || words2.size < 3) continue;
     const inter = new Set([...words1].filter(x => words2.has(x)));
     const uni   = new Set([...words1, ...words2]);
     const sim   = inter.size / uni.size;
-    if (sim > threshold) {
-      console.log(`Tweet too similar (${(sim * 100).toFixed(1)}% word match)`); return true;
-    }
+    if (sim > threshold) return true;
   }
   return false;
 }
@@ -509,15 +551,6 @@ New tweet:
 Recent tweets:
 ${(recentTweets || []).map((t,i)=>`${i+1}. "${t}"`).join('\n')}
 
-Check for:
-1. Same structure (statement + stats + call-to-action)
-2. Repeated phrases like "with a TVL of" or "APY of 30%"
-3. Similar opening/closing phrases
-4. Same style of presenting statistics
-5. Identical sentiment or energy
-6. Formulaic patterns
-7. Generic marketing language
-
 Respond only "YES" if too similar/formulaic, or "NO" if sufficiently different.`;
   try {
     const resp = await chatOnce({ prompt, max: 50 });
@@ -531,7 +564,7 @@ Respond only "YES" if too similar/formulaic, or "NO" if sufficiently different.`
 }
 
 // ---------- Builders ----------
-const usedFallbacksThisRun = new Set(); // avoid repeating a fallback within the same process
+const usedFallbacksThisRun = new Set();
 
 async function generateProtocolTweet(maxAttempts = 5) {
   const recentTweets = await getRecentTweets();
@@ -558,12 +591,12 @@ async function generateProtocolTweet(maxAttempts = 5) {
     const docsContext  = docsContent || getDocumentationContext().keyFacts.join('\n');
 
     const statsContext = includeStats
-      ? `\nCurrent stats (weave naturally, never as "with TVL of X and APY of Y"):
+      ? `\nCurrent stats (weave naturally; no "with TVL of X and APY of Y"):
 TVL ${stats.tvl}, APY ${stats.apy}%, AERO locked ${stats.aeroLocked}, iAERO/AERO ${stats.iAeroPeg}`
       : '\nDo not include specific stats in this tweet.';
 
     const recentContext = (recentTweets?.length || 0) > 0
-      ? `\n\nRecent tweets to avoid copying in structure/tone:\n${recentTweets.slice(0, 8).join('\n---\n')}`
+      ? `\n\nRecent tweets to avoid copying:\n${recentTweets.slice(0, 8).join('\n---\n')}`
       : '';
 
     const styleGuides = {
@@ -572,7 +605,7 @@ TVL ${stats.tvl}, APY ${stats.apy}%, AERO locked ${stats.aeroLocked}, iAERO/AERO
       question: 'Ask an engaging question. No CTA.',
       announcement: 'Sound like news/update. Active voice.',
       thread_starter: 'Write like a thread starter. End with "A thread 🧵" or "Let me explain 👇".',
-      stat_highlight: 'Lead with ONE impressive number; tell a story around it.',
+      stat_highlight: 'Lead with ONE number; tell a story around it.',
       feature_focus: 'Deep dive on ONE feature. Technical but accessible.',
       user_story: 'Write from a user POV. Make it specific.',
       myth_buster: 'Myth vs Reality; be direct.',
@@ -592,12 +625,10 @@ ${recentContext}
 
 CRITICAL:
 - Under 280 chars
-- MUST differ in structure/tone from above recents
+- MUST differ in structure/tone from the recents
 - FORBIDDEN: "with a TVL of", "and APY of", "don't miss this opportunity", "join us today", "dive into", "enhance your", "ready to"
 - Avoid [generic statement] + [stats] + [CTA]
-- If stats included, weave naturally; do not list
 - Max 1 hashtag; vary it
-- Be specific, not generic marketing
 - Sound human; have an opinion`;
 
     try {
@@ -605,7 +636,7 @@ CRITICAL:
       let generated = extractOpenAIText(resp).trim();
       if (!generated) { console.warn('Empty OpenAI content; retrying…'); continue; }
 
-      // Trim first, then check hash (so it matches posted text)
+      // Trim first, then hash
       generated = safeTrimTweet(generated, 280);
       const tweetHash = hashTweet(generated);
       if (postedHashes.has(tweetHash)) { console.log(`Hash exists (attempt ${attempt+1}); regenerating…`); continue; }
@@ -624,7 +655,7 @@ CRITICAL:
     }
   }
 
-  // Fallbacks (avoid repeating within the same run)
+  // Fallbacks (avoid reusing within the same run)
   const fallbacks = [
     "Nobody:\nAbsolutely nobody:\nMe checking if my 4-year lock has expired yet: 🤡\n\n(this post made by iAERO gang)",
     "Breaking: Area man discovers one weird trick to avoid 4-year lockups. ve(3,3) protocols hate him! 🗞️",
@@ -734,7 +765,7 @@ function isDuplicateTweetError(err) {
     err?.status === 403 ||
     msg.includes('duplicate') ||
     msg.includes('already posted') ||
-    codes.has?.(186) || // legacy duplicate status
+    codes.has?.(186) ||
     codes.has?.(187)
   );
 }
@@ -763,12 +794,18 @@ async function postTweet(retries = 2) {
 
       const tweet = await twitterClient.v2.tweet(content);
       console.log('Tweet posted successfully:', tweet?.data?.id);
+
+      // Record success in hash and local tweet log
       postedHashes.add(tweetHash);
-      await saveHashes();
+      tweetLog.push(content);
+      if (tweetLog.length > 500) tweetLog = tweetLog.slice(-500);
+      await Promise.all([saveHashes(), saveTweetLog()]);
+
       return tweet;
     } catch (error) {
       lastError = error;
       console.error(`Failed to post tweet (attempt ${i + 1}/${retries + 1}):`, error?.message || error);
+
       // If Twitter says it's a duplicate, record the hash so we don't try again.
       if (content && isDuplicateTweetError(error)) {
         const h = hashTweet(safeTrimTweet(content, 280));
@@ -778,6 +815,7 @@ async function postTweet(retries = 2) {
           await saveHashes();
         }
       }
+
       if (error?.code === 429 || error?.status === 429) {
         console.log('Rate limited; stopping retries to avoid ban');
         break;
@@ -823,8 +861,10 @@ async function startBot() {
     rpcUrl:          process.env.RPC_URL ? 'custom' : 'default Base RPC'
   });
 
+  await initDataFiles();
   await loadHashes();
-  await primePostedHashesFromTimeline(80); // single-page seed; re-prime will reschedule if 429
+  await loadTweetLog();
+  await primePostedHashesFromTimeline(80); // Will fall back to local log if 429
 
   console.log('Initializing stats cache…');
   const testStats = await getProtocolStats(true);
@@ -889,7 +929,9 @@ Lock. Stake. Earn. Stay liquid.`;
         const tw = await twitterClient.v2.tweet(statsTweet);
         console.log('Daily stats tweet posted:', tw?.data?.id);
         postedHashes.add(h);
-        await saveHashes();
+        tweetLog.push(statsTweet);
+        if (tweetLog.length > 500) tweetLog = tweetLog.slice(-500);
+        await Promise.all([saveHashes(), saveTweetLog()]);
       } catch (err) {
         console.error('Failed to post daily stats:', err?.message || err);
         if (isDuplicateTweetError(err)) {
@@ -902,20 +944,21 @@ Lock. Stake. Earn. Stay liquid.`;
 
   // Stats refresh
   setInterval(async () => {
-    console.log('Refreshing stats cache…');
+    if (DEBUG_STATS) console.log('Refreshing stats cache…');
     try { await getProtocolStats(true); } catch (e) { console.error('Stats refresh failed:', e?.message || e); }
   }, 5 * 60 * 1000);
 
   // Hash save + memory
   setInterval(async () => {
-    await saveHashes();
+    await Promise.all([saveHashes(), saveTweetLog()]);
     const usage = process.memoryUsage();
     console.log('Memory usage:', {
       rss: `${Math.round(usage.rss/1024/1024)}MB`,
       heap: `${Math.round(usage.heapUsed/1024/1024)}MB / ${Math.round(usage.heapTotal/1024/1024)}MB`,
       external: `${Math.round(usage.external/1024/1024)}MB`,
       hashCount: postedHashes.size,
-      topicCooldowns: topicCooldowns.size
+      topicCooldowns: topicCooldowns.size,
+      tweetLogCount: tweetLog.length
     });
   }, 30 * 60 * 1000);
 }
@@ -925,22 +968,22 @@ process.on('unhandledRejection', err => {
 });
 process.on('uncaughtException', async err => {
   console.error('Uncaught exception:', err);
-  await saveHashes();
+  await Promise.allSettled([saveHashes(), saveTweetLog()]);
   process.exit(1);
 });
 process.on('SIGTERM', async () => {
   console.log('SIGTERM: saving state, shutting down gracefully…');
-  await saveHashes();
+  await Promise.allSettled([saveHashes(), saveTweetLog()]);
   process.exit(0);
 });
 process.on('SIGINT', async () => {
   console.log('SIGINT: saving state, shutting down gracefully…');
-  await saveHashes();
+  await Promise.allSettled([saveHashes(), saveTweetLog()]);
   process.exit(0);
 });
 
 startBot().catch(async err => {
   console.error('Failed to start bot:', err);
-  await saveHashes();
+  await Promise.allSettled([saveHashes(), saveTweetLog()]);
   process.exit(1);
 });

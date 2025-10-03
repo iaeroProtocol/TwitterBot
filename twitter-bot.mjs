@@ -1,4 +1,4 @@
-// twitter-bot.mjs — Production: persistent dedupe, rate-limit safe, no manual fallbacks
+// twitter-bot.mjs — Production: persistent dedupe, rate-limit safe, GPT-5 Responses API, no manual fallbacks
 import 'dotenv/config';
 import { TwitterApi } from 'twitter-api-v2';
 import OpenAI from 'openai';
@@ -35,44 +35,54 @@ const OPENAI_MODEL       = process.env.OPENAI_MODEL || 'gpt-5-mini';
 const STRICT_ORIGINALITY = OPENAI_ENABLED && process.env.STRICT_ORIGINALITY === '1';
 const DEBUG_STATS        = process.env.DEBUG_STATS === '1';
 
-/* ============================== OpenAI wrapper ========================== */
-function extractOpenAIText(resp) {
-  const msg = resp?.choices?.[0]?.message;
-  if (!msg) return '';
-  if (typeof msg.content === 'string') return msg.content;
-  if (Array.isArray(msg.content)) {
-    return msg.content.map(p => (typeof p === 'string' ? p : (p?.text || ''))).join('');
+/* ============================== OpenAI (Responses API) ================== */
+// Robust extractor for the Responses API
+function extractResponsesText(resp) {
+  if (typeof resp?.output_text === 'string' && resp.output_text.trim().length) {
+    return resp.output_text;
   }
-  return '';
+  const out = [];
+  const outputs = resp?.output ?? [];
+  for (const item of outputs) {
+    const content = item?.content || [];
+    for (const c of content) {
+      if (c?.type === 'output_text' && typeof c?.text === 'string') {
+        out.push(c.text);
+      }
+    }
+  }
+  return out.join('').trim();
 }
 
-// Try primary model, then small fallback(s)
-async function chatOnce({ prompt, max = 220 }) {
-  const models = [
-    OPENAI_MODEL,
-    'gpt-4o-mini',
-    'gpt-4o'
-  ].filter(Boolean);
+// Unified helper: Responses API (recommended for GPT-5). Falls back to Chat Completions only if Responses fails.
+async function chatOnce({ prompt, max = 500, instructions, messages, reasoningEffort = 'low' }) {
+  const model = OPENAI_MODEL;
 
-  let lastErr;
-  for (const model of models) {
+  // Use Responses API (preferred)
+  try {
+    const payload = {
+      model,
+      reasoning: { effort: reasoningEffort },          // harmless for non-reasoning models too
+      ...(instructions ? { instructions } : {}),
+      ...(messages ? { input: messages } : { input: prompt }),
+      max_output_tokens: max                           // Responses API token cap
+    };
+    const resp = await openai.responses.create(payload);
+    return { _raw: resp, text: extractResponsesText(resp) };
+  } catch (e) {
+    // Optional compatibility fallback for non-GPT-5 models if configured
     try {
       const resp = await openai.chat.completions.create({
         model,
-        messages: [{ role: 'user', content: prompt }],
-        max_completion_tokens: max,
-        // Keep params light; GPT-5 ignores temp anyway
-        temperature: model.startsWith('gpt-5') ? undefined : 0.9,
-        presence_penalty: model.startsWith('gpt-5') ? undefined : 0.6,
-        frequency_penalty: model.startsWith('gpt-5') ? undefined : 0.6
+        messages: messages || [{ role: 'user', content: prompt }],
+        max_completion_tokens: max
       });
-      return resp;
-    } catch (e) {
-      lastErr = e;
-      console.error(`[OpenAI] ${model} failed:`, e?.message || e);
+      const txt = resp?.choices?.[0]?.message?.content;
+      return { _raw: resp, text: (typeof txt === 'string' ? txt : Array.isArray(txt) ? txt.join('') : '') || '' };
+    } catch (e2) {
+      throw e;
     }
   }
-  throw lastErr || new Error('All OpenAI models failed');
 }
 
 /* ============================== Chain provider ========================== */
@@ -472,8 +482,8 @@ ${(recentTweets||[]).map((t,i)=>`${i+1}. "${t}"`).join('\n')}
 
 Reply "YES" if too similar, otherwise "NO".`;
   try {
-    const resp = await chatOnce({ prompt, max: 50 });
-    const verdict = extractOpenAIText(resp).trim().toUpperCase();
+    const { text } = await chatOnce({ prompt, max: 50 });
+    const verdict = (text || '').trim().toUpperCase();
     return verdict.includes('YES');
   } catch { return false; }
 }
@@ -495,15 +505,13 @@ function localUniqueTweet({ topic, mode='protocol' }) {
         `anon, ${topic} alpha isn’t on the timeline.`,
         `${topic}. ngmi if you ignore the fees.`
       ];
-  // Try a handful of unique variants
   for (let i=0;i<24;i++){
     const t = safeTrimTweet(pick(templates), 280);
     const h = hashTweet(t);
     if (!postedHashes.has(h) && !tweetLog.includes(t)) return t;
   }
-  // Last-resort: tiny nonce to change hash but keep semantics
   const base = safeTrimTweet(pick(templates), 277);
-  return `${base} ·.`; // two char salt
+  return `${base} ·.`; // tiny salt to force new hash
 }
 
 /* ============================== Builders ================================ */
@@ -534,7 +542,7 @@ TVL ${stats.tvl}, APY ${stats.apy}%, AERO locked ${stats.aeroLocked}, iAERO/AERO
       : '\nDo not include specific stats in this tweet.';
 
     const recentCtx = (recentTweets?.length||0)>0
-      ? `\n\nRecent tweets to avoid copying:\n${recentTweets.slice(0,8).join('\n---\n')}`
+      ? `\n\nRecent tweets to avoid copying:\n${recentTweets.slice(0, 8).join('\n---\n')}`
       : '';
 
     const prompt = `Based on iAERO docs:
@@ -550,8 +558,8 @@ Under 280 chars.`;
 
     let generated = '';
     try {
-      const resp = await chatOnce({ prompt, max: 220 });
-      generated = extractOpenAIText(resp).trim();
+      const { text } = await chatOnce({ prompt, max: 500 });
+      generated = (text || '').trim();
     } catch (e) {
       console.error('OpenAI error (protocol tweet):', e?.message || e);
     }
@@ -574,7 +582,6 @@ Under 280 chars.`;
     console.log(`Too similar (${style}, attempt ${attempt+1}); regenerating…`);
   }
 
-  // If all attempts fail uniqueness, force unique local
   const forced = localUniqueTweet({ topic: pick(PROTOCOL_TOPICS), mode:'protocol' });
   console.log('Using forced-unique local protocol tweet');
   return forced;
@@ -589,7 +596,7 @@ async function generateShitpost(maxAttempts=4) {
     const style = pick(styles);
 
     const recentCtx = (recentTweets?.length||0)>0
-      ? `\n\nAvoid repeating themes/jokes from these:\n${recentTweets.slice(0,5).join('\n')}` : '';
+      ? `\n\nAvoid repeating themes/jokes from these:\n${recentTweets.slice(0, 5).join('\n')}` : '';
 
     const prompt = `Create a witty, crypto-native tweet about ${topic}.
 Style: ${style}
@@ -599,8 +606,8 @@ ${recentCtx}`;
 
     let generated = '';
     try {
-      const resp = await chatOnce({ prompt, max: 200 });
-      generated = extractOpenAIText(resp).trim();
+      const { text } = await chatOnce({ prompt, max: 200 });
+      generated = (text || '').trim();
     } catch (e) {
       console.error('OpenAI error (shitpost):', e?.message || e);
     }

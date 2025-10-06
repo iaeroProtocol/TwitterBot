@@ -168,6 +168,89 @@ async function saveTweetLog() {
   }
 }
 
+// ---------- Similarity helpers (history-wide) ----------
+function normalizeForSim(s) {
+  return (s || '')
+    .toLowerCase()
+    .replace(/https?:\/\/\S+/g, '')  // strip urls
+    .replace(/@\w+/g, '')            // strip mentions
+    .replace(/#(\w+)/g, '$1')        // drop #
+    .replace(/\d+(\.\d+)?/g, '0')    // neuter numbers so 811K vs 823K don't evade
+    .replace(/[^\p{L}\p{N}\s]/gu, ' ') // drop emoji/punct (keep letters/numbers)
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function tokens(s) {
+  return normalizeForSim(s).split(' ').filter(Boolean);
+}
+
+function jaccard(a, b) {
+  const A = new Set(a), B = new Set(b);
+  const inter = [...A].filter(x => B.has(x)).length;
+  const uni   = new Set([...A, ...B]).size || 1;
+  return inter / uni;
+}
+
+function bigrams(arr) {
+  const out = [];
+  for (let i = 0; i < arr.length - 1; i++) out.push(arr[i] + ' ' + arr[i+1]);
+  return out;
+}
+
+// Tiny SimHash over unigrams+bigrams
+function simhash(s) {
+  const t = tokens(s);
+  const feats = [...t, ...bigrams(t)];
+  const bits = 32; // lightweight; enough for near-dup catch
+  const v = new Array(bits).fill(0);
+  for (const f of feats) {
+    // FNV-1a 32-bit
+    let h = 0x811c9dc5;
+    for (let i = 0; i < f.length; i++) {
+      h ^= f.charCodeAt(i);
+      h = (h + ((h << 1) + (h << 4) + (h << 7) + (h << 8) + (h << 24))) >>> 0;
+    }
+    for (let b = 0; b < bits; b++) {
+      v[b] += (h & (1 << b)) ? 1 : -1;
+    }
+  }
+  let out = 0;
+  for (let b = 0; b < bits; b++) if (v[b] > 0) out |= (1 << b);
+  return out >>> 0;
+}
+function hamming32(a, b) {
+  let x = a ^ b, c = 0;
+  while (x) { x &= x - 1; c++; }
+  return c;
+}
+
+// History-wide check: last N posts from local tweetLog
+function tooSimilarToHistory(newText, { maxLookback = 120, wordThresh = 0.82, bigramThresh = 0.72, simhashHD = 6 } = {}) {
+  const history = tweetLog.slice(-maxLookback);
+  if (history.length === 0) return false;
+
+  const newTok  = tokens(newText);
+  const newBi   = bigrams(newTok);
+  const newHash = simhash(newText);
+
+  for (const oldText of history) {
+    const oldTok = tokens(oldText);
+    const oldBi  = bigrams(oldTok);
+
+    const j1 = jaccard(newTok, oldTok);
+    if (j1 >= wordThresh) return true;
+
+    const j2 = jaccard(newBi, oldBi);
+    if (j2 >= bigramThresh) return true;
+
+    const hd = hamming32(newHash, simhash(oldText));
+    if (hd <= simhashHD) return true;
+  }
+  return false;
+}
+
+
 /* ============================== Topics & helpers ======================== */
 const PROTOCOL_TOPICS = [
   "How iAERO's liquid staking works",
@@ -390,7 +473,7 @@ async function fetchMyTweetsRaw(count = 80) {
   }
 }
 
-async function getRecentTweets(count = 20) {
+async function getRecentTweets(count = 50) {
   if (recentTweetsCache.tweets?.length>0 && (Date.now()-recentTweetsCache.timestamp)<recentTweetsCache.ttl) {
     if (DEBUG_STATS) console.log('Using cached recent tweets');
     return recentTweetsCache.tweets;
@@ -576,10 +659,17 @@ Under 280 chars.`;
       || (STRICT_ORIGINALITY && await checkWithOpenAI(generated, recentTweets.slice(0,10)));
 
     if (!tooSimilar) {
+      // History-wide guard (ignores number/emoji tweaks)
+      if (tooSimilarToHistory(generated)) {
+        console.log('Rejected by history-wide similarity; regenerating…');
+        continue;
+      }
       console.log(`Generated ${style} tweet on attempt ${attempt+1}`);
       return generated;
     }
     console.log(`Too similar (${style}, attempt ${attempt+1}); regenerating…`);
+    
+
   }
 
   const forced = localUniqueTweet({ topic: pick(PROTOCOL_TOPICS), mode:'protocol' });
@@ -622,10 +712,16 @@ ${recentCtx}`;
 
     const similar = await isTwitterSimilar(generated, recentTweets, 0.30);
     if (!similar) {
-      console.log(`Generated original shitpost (${style}) on attempt ${attempt+1}`);
-      return generated;
+      if (tooSimilarToHistory(generated)) {
+      console.log('Rejected by history-wide similarity; regenerating…');
+      continue;
+      }
+    console.log(`Generated original shitpost (${style}) on attempt ${attempt+1}`);
+    return generated;
     }
     console.log(`Shitpost too similar (attempt ${attempt+1}); regenerating…`);
+
+
   }
 
   const forced = localUniqueTweet({ topic: pick(SHITPOST_TOPICS), mode:'shitpost' });
@@ -650,6 +746,21 @@ async function postTweet(retries=2) {
       if (!content) { console.log('No tweet content generated; skip'); return null; }
 
       content = safeTrimTweet(content, 280); // TRIM FIRST
+
+      // FINAL guard against near-duplicate history (even if a generator slips)
+      if (tooSimilarToHistory(content)) {
+        console.log('Pre-post history similarity block; regenerating content…');
+        // Try once more: regenerate once, then if still too similar, skip this cycle
+        const retry = isProtocol ? await generateProtocolTweet() : await generateShitpost();
+        if (!retry) return null;
+        const trimmed = safeTrimTweet(retry, 280);
+        if (tooSimilarToHistory(trimmed)) {
+          console.log('Retry also similar to history; skipping this cycle');
+          return null;
+        }
+        content = trimmed;
+}
+
       const h = hashTweet(content);
       if (postedHashes.has(h)) { console.log('Hash collision pre-post; regenerating…'); continue; }
 

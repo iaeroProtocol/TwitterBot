@@ -276,7 +276,7 @@ function isTopicOnCooldown(topic){ const t = topicCooldowns.get(topic); return t
 function markTopicUsed(topic){ topicCooldowns.set(topic, Date.now()); }
 
 function compactUSDorToken(n){ if(!isFinite(n)||n<=0) return '0'; if(n>=1_000_000) return (n/1_000_000).toFixed(2)+'M'; if(n>=1_000) return (n/1_000).toFixed(0)+'K'; return n.toFixed(0); }
-function safeTrimTweet(t, max=280){ const s=[...(t||'')]; return s.length<=max ? (t||'') : s.slice(0,max-1).join('')+'…'; }
+function safeTrimTweet(t, max=500){ const s=[...(t||'')]; return s.length<=max ? (t||'') : s.slice(0,max-1).join('')+'…'; }
 function pick(arr){ return arr[Math.floor(Math.random()*arr.length)]; }
 
 /* ============================== On-chain stats ========================== */

@@ -371,7 +371,7 @@ async function getProtocolStats(force = false) {
     return statsCache.data;
   }
   console.log('Fetching fresh protocol stats...');
-  const VAULT_ADDRESS   = process.env.VAULT_ADDRESS   || '0x877398Aea8B5cCB0D482705c2D88dF768c953957';
+  const VAULT_ADDRESS   = process.env.VAULT_ADDRESS   || '0x180DAB53968e599Dd43CF431E27CB01AA5C37909';
   const IAERO_AERO_POOL = process.env.IAERO_AERO_POOL || '0x08d49DA370ecfFBC4c6Fdd2aE82B2D6aE238Affd';
   const LIQ_USDC_POOL   = process.env.LIQ_USDC_POOL   || '0x8966379fCD16F7cB6c6EA61077B6c4fAfECa28f4';
   const AERO_USDC_POOL  = process.env.AERO_USDC_POOL  || '0x6cDcb1C4A4D1C3C6d054b27AC5B77e89eAFb971d';
@@ -589,11 +589,11 @@ function localUniqueTweet({ topic, mode='protocol' }) {
         `${topic}. ngmi if you ignore the fees.`
       ];
   for (let i=0;i<24;i++){
-    const t = safeTrimTweet(pick(templates), 280);
+    const t = safeTrimTweet(pick(templates), 500);
     const h = hashTweet(t);
     if (!postedHashes.has(h) && !tweetLog.includes(t)) return t;
   }
-  const base = safeTrimTweet(pick(templates), 277);
+  const base = safeTrimTweet(pick(templates), 500);
   return `${base} ·.`; // tiny salt to force new hash
 }
 
@@ -651,7 +651,7 @@ Under 280 chars.`;
       generated = localUniqueTweet({ topic, mode:'protocol' });
     }
 
-    generated = safeTrimTweet(generated, 280);
+    generated = safeTrimTweet(generated, 500);
     const h = hashTweet(generated);
     if (postedHashes.has(h)) { console.log(`Hash exists (attempt ${attempt+1}); regenerating…`); continue; }
 

@@ -798,8 +798,8 @@ async function postTweet(retries=2) {
 }
 
 function getRandomIntervalMinutes(){
-  const min = Number(process.env.TWEET_MIN_MINUTES || 240);
-  const max = Number(process.env.TWEET_MAX_MINUTES || 360);
+  const min = Number(process.env.TWEET_MIN_MINUTES || 720);
+  const max = Number(process.env.TWEET_MAX_MINUTES || 1440);
   return Math.floor(Math.random()*(max-min+1)+min);
 }
 function scheduleNextTweet(){

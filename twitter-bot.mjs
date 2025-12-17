@@ -365,6 +365,39 @@ async function fetchGitBookContent() {
     return null;
   }
 }
+
+/* ============================== Live APY from GitHub ==================== */
+const YIELD_HISTORY_URL = 'https://raw.githubusercontent.com/iaeroProtocol/ChainProcessingBot/main/data/yield_history.json';
+
+async function fetchLiveAPY() {
+  try {
+    const res = await fetch(YIELD_HISTORY_URL);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    
+    // Get second-to-last entry in series
+    const series = data?.series;
+    if (!Array.isArray(series) || series.length < 2) {
+      console.warn('Yield series too short, falling back to latest');
+      return data?.latest?.apyPct?.toFixed(2) || '0.00';
+    }
+    
+    const secondToLast = series[series.length - 2];
+    const apy = secondToLast?.apyPct;
+    
+    if (typeof apy !== 'number' || !isFinite(apy)) {
+      console.warn('Invalid APY value, using latest');
+      return data?.latest?.apyPct?.toFixed(2) || '0.00';
+    }
+    
+    console.log('✓ Live APY fetched:', apy.toFixed(2) + '%');
+    return apy.toFixed(2);
+  } catch (e) {
+    console.error('Failed to fetch live APY:', e?.message || e);
+    return '0.00';
+  }
+}
+
 async function getProtocolStats(force = false) {
   if (!force && statsCache.data && (Date.now()-statsCache.timestamp) < statsCache.ttl) {
     if (DEBUG_STATS) console.log('Returning cached stats');
@@ -426,9 +459,11 @@ async function getProtocolStats(force = false) {
   console.log('LIQ Minted:', liqMinted);
   console.log('====================');
 
+  const liveAPY = await fetchLiveAPY();
+
   const stats = {
     tvl:         compactUSDorToken(tvlFloat),
-    apy:         '30', // placeholder
+    apy:         liveAPY,
     totalStaked: compactUSDorToken(iaeroMinted),
     liqPrice:    isFinite(liqPrice)  ? liqPrice.toFixed(4)  : '0.0000',
     aeroLocked:  compactUSDorToken(aeroLocked),

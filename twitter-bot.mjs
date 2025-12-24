@@ -367,27 +367,19 @@ async function fetchGitBookContent() {
 }
 
 /* ============================== Live APY from GitHub ==================== */
-const YIELD_HISTORY_URL = 'https://raw.githubusercontent.com/iaeroProtocol/ChainProcessingBot/main/data/yield_history.json';
+const YIELD_HISTORY_URL = 'https://raw.githubusercontent.com/iaeroProtocol/ChainProcessingBot/main/data/estimated_rewards_usd.json';
 
 async function fetchLiveAPY() {
   try {
-    const res = await fetch(YIELD_HISTORY_URL);
+    const res = await fetch(ESTIMATED_REWARDS_URL);
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const data = await res.json();
     
-    // Get second-to-last entry in series
-    const series = data?.series;
-    if (!Array.isArray(series) || series.length < 2) {
-      console.warn('Yield series too short, falling back to latest');
-      return data?.latest?.apyPct?.toFixed(3) || '0.00';
-    }
-    
-    const secondToLast = series[series.length - 2];
-    const apy = secondToLast?.apyPct;
+    const apy = data?.apyPct;
     
     if (typeof apy !== 'number' || !isFinite(apy)) {
-      console.warn('Invalid APY value, using latest');
-      return data?.latest?.apyPct?.toFixed(2) || '0.00';
+      console.warn('Invalid APY value in estimated_rewards_usd.json');
+      return '0.00';
     }
     
     console.log('✓ Live APY fetched:', apy.toFixed(2) + '%');

@@ -379,7 +379,7 @@ async function fetchLiveAPY() {
     const series = data?.series;
     if (!Array.isArray(series) || series.length < 2) {
       console.warn('Yield series too short, falling back to latest');
-      return data?.latest?.apyPct?.toFixed(2) || '0.00';
+      return data?.latest?.apyPct?.toFixed(3) || '0.00';
     }
     
     const secondToLast = series[series.length - 2];

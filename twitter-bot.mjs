@@ -367,7 +367,7 @@ async function fetchGitBookContent() {
 }
 
 /* ============================== Live APY from GitHub ==================== */
-const YIELD_HISTORY_URL = 'https://raw.githubusercontent.com/iaeroProtocol/ChainProcessingBot/main/data/estimated_rewards_usd.json';
+const ESTIMATED_REWARDS_URL = 'https://raw.githubusercontent.com/iaeroProtocol/ChainProcessingBot/main/data/estimated_rewards_usd.json';
 
 async function fetchLiveAPY() {
   try {

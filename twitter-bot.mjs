@@ -30,6 +30,7 @@ const twitterClient = new TwitterApi({
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
+const TWEETS_ENABLED = process.env.TWEETS_ENABLED !== '0';
 const OPENAI_ENABLED     = !!process.env.OPENAI_API_KEY;
 const OPENAI_MODEL       = process.env.OPENAI_MODEL || 'gpt-5-mini';
 const STRICT_ORIGINALITY = OPENAI_ENABLED && process.env.STRICT_ORIGINALITY === '1';
@@ -764,6 +765,10 @@ function isDuplicateTweetError(err) {
 }
 
 async function postTweet(retries=2) {
+  if (!TWEETS_ENABLED) {
+    console.log('Regular tweets disabled (TWEETS_ENABLED=0); skipping');
+    return null;
+  }
   let lastError=null;
   for (let i=0;i<=retries;i++){
     let content=null;
@@ -852,6 +857,7 @@ async function startBot(){
     hasTwitterCreds: !!process.env.TWITTER_API_KEY,
     hasOpenAI:       OPENAI_ENABLED,
     model:           OPENAI_MODEL,
+    tweetsEnabled:   TWEETS_ENABLED,
     vaultAddress:    process.env.VAULT_ADDRESS || '0x877398Aea8B5cCB0D482705c2D88dF768c953957',
     rpcUrl:          process.env.RPC_URL ? 'custom' : 'default Base RPC'
   });

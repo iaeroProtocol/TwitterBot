@@ -415,11 +415,12 @@ async function getProtocolStats(force = false) {
 
   // V5 is frozen after the migration; it is only read for LIQ minted.
   const VAULT_ABI = [
-    'function totalLIQMinted() view returns (uint256)'
+    'function totalLIQMinted() view returns (uint256)',
+    'function totalIAEROMinted() view returns (uint256)'
   ];
   const vault = new ethers.Contract(VAULT_ADDRESS, VAULT_ABI, provider);
   const votingEscrow = new ethers.Contract(VOTING_ESCROW, ['function staked(uint256) view returns (uint128 amount, uint48 end, bool isPermanent)'], provider);
-  const iaeroToken   = new ethers.Contract(IAERO_ADDRESS, ['function totalSupply() view returns (uint256)'], provider);
+
 
   const retry = async (fn, fallback=0, tries=5) => {
     for (let i=0;i<tries;i++){
@@ -436,7 +437,8 @@ async function getProtocolStats(force = false) {
   console.log(`✓ AERO locked (stake #${AERO_STAKE_ID}):`, aeroLocked);
 
   const liqMinted   = await retry(async()=>parseFloat(ethers.formatEther(await vault.totalLIQMinted())));
-  const iaeroMinted = await retry(async()=>parseFloat(ethers.formatEther(await iaeroToken.totalSupply())));
+  // iAERO minted by the vault, as the tweet has always reported (not iAERO.totalSupply(); see decision #17).
+  const iaeroMinted = await retry(async()=>parseFloat(ethers.formatEther(await vault.totalIAEROMinted())));
   console.log('✓ LIQ minted:',  liqMinted);
   console.log('✓ iAERO minted:',iaeroMinted);
 

@@ -14,21 +14,25 @@ import { fileURLToPath } from 'url';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname  = path.dirname(__filename);
 
+// Dry run: `node twitter-bot.mjs --dry-run-stats` (or DRY_RUN_STATS=1) prints the daily stats
+// tweet and exits. No Twitter/OpenAI clients, no health server, nothing is posted.
+const DRY_RUN_STATS = process.argv.includes('--dry-run-stats') || process.env.DRY_RUN_STATS === '1';
+
 /* ============================== Healthcheck ============================= */
 const app  = express();
 const PORT = process.env.PORT || 8080;
 app.get('/health', (_req, res) => res.status(200).json({ status: 'ok', uptime: process.uptime() }));
-app.listen(PORT, () => console.log(`Health check server on :${PORT}`));
+if (!DRY_RUN_STATS) app.listen(PORT, () => console.log(`Health check server on :${PORT}`));
 
 /* ============================== Clients ================================= */
-const twitterClient = new TwitterApi({
+const twitterClient = DRY_RUN_STATS ? null : new TwitterApi({
   appKey:       process.env.TWITTER_API_KEY,
   appSecret:    process.env.TWITTER_API_SECRET,
   accessToken:  process.env.TWITTER_ACCESS_TOKEN,
   accessSecret: process.env.TWITTER_ACCESS_SECRET
 });
 
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+const openai = DRY_RUN_STATS ? null : new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 const TWEETS_ENABLED = process.env.TWEETS_ENABLED !== '0';
 const OPENAI_ENABLED     = !!process.env.OPENAI_API_KEY;
@@ -301,6 +305,8 @@ async function resolveCoreTokens(cfg) {
   const liqPair = await readPair(cfg.LIQ_USDC_POOL);
   const LIQ  = (liqPair.token0 === usdc)  ? liqPair.token1  : liqPair.token0;
   const iaeroPair = await readPair(cfg.IAERO_AERO_POOL);
+  // Pool env vars must point at the same AERO (old Aerodrome AERO != new Aero AERO)
+  if (iaeroPair.token0 !== AERO && iaeroPair.token1 !== AERO) throw new Error('IAERO_AERO_POOL does not hold the AERO priced by AERO_USDC_POOL; set the pool env vars together');
   const IAERO = (iaeroPair.token0 === AERO) ? iaeroPair.token1 : iaeroPair.token0;
 
   const decMap = new Map();
@@ -397,20 +403,23 @@ async function getProtocolStats(force = false) {
     return statsCache.data;
   }
   console.log('Fetching fresh protocol stats...');
+  // Aero pools (2026-10-22 migration). The three pool vars must change together.
   const VAULT_ADDRESS   = process.env.VAULT_ADDRESS   || '0x180DAB53968e599Dd43CF431E27CB01AA5C37909';
-  const IAERO_AERO_POOL = process.env.IAERO_AERO_POOL || '0x08d49DA370ecfFBC4c6Fdd2aE82B2D6aE238Affd';
-  const LIQ_USDC_POOL   = process.env.LIQ_USDC_POOL   || '0x8966379fCD16F7cB6c6EA61077B6c4fAfECa28f4';
-  const AERO_USDC_POOL  = process.env.AERO_USDC_POOL  || '0x6cDcb1C4A4D1C3C6d054b27AC5B77e89eAFb971d';
+  const IAERO_AERO_POOL = process.env.IAERO_AERO_POOL || '0x72Decb30DFE4F6Cf7Db3ba1D58411dDda5ed903b';
+  const LIQ_USDC_POOL   = process.env.LIQ_USDC_POOL   || '0xE4553d8d7284192ab84346A9C9FFdb69dCE30C71';
+  const AERO_USDC_POOL  = process.env.AERO_USDC_POOL  || '0xF634058dC94e6BF8e828E27621320C423bC8B18E';
   const USDC_ADDRESS    = process.env.USDC_ADDRESS    || '0x833589fCD6EDb6E08f4c7C32D4f71b54bdA02913';
+  const IAERO_ADDRESS   = process.env.IAERO_ADDRESS   || '0x81034Fb34009115F215f5d5F564AAc9FfA46a1Dc';
+  const VOTING_ESCROW   = process.env.VOTING_ESCROW_ADDRESS || '0xBF7977E1521e9a3032bf7243Ee4712f311f13915';
+  const AERO_STAKE_ID   = process.env.PROTOCOL_AERO_STAKE_ID || '1584';
 
+  // V5 is frozen after the migration; it is only read for LIQ minted.
   const VAULT_ABI = [
-    'function totalAEROLocked() view returns (uint256)',
-    'function totalLIQMinted() view returns (uint256)',
-    'function totalIAEROMinted() view returns (uint256)',
-    'function vaultStatus() view returns (uint256,uint256,uint256,uint256,uint256,uint256,uint256,uint256,uint256,bool,bool)',
-    'function getTotalValueLocked() view returns (uint256)'
+    'function totalLIQMinted() view returns (uint256)'
   ];
   const vault = new ethers.Contract(VAULT_ADDRESS, VAULT_ABI, provider);
+  const votingEscrow = new ethers.Contract(VOTING_ESCROW, ['function staked(uint256) view returns (uint128 amount, uint48 end, bool isPermanent)'], provider);
+  const iaeroToken   = new ethers.Contract(IAERO_ADDRESS, ['function totalSupply() view returns (uint256)'], provider);
 
   const retry = async (fn, fallback=0, tries=5) => {
     for (let i=0;i<tries;i++){
@@ -422,13 +431,12 @@ async function getProtocolStats(force = false) {
     return fallback;
   };
 
-  let aeroLocked = await retry(async()=>parseFloat(ethers.formatEther(await vault.totalAEROLocked())));
-  if (!aeroLocked) aeroLocked = await retry(async()=>parseFloat(ethers.formatEther(await vault.getTotalValueLocked())));
-  if (!aeroLocked) aeroLocked = await retry(async()=>{ const vs = await vault.vaultStatus(); return parseFloat(ethers.formatEther(vs[0])); });
-  console.log('✓ AERO locked:', aeroLocked);
+  // Backing = the protocol's permanent Aero stake on the VotingEscrow
+  const aeroLocked = await retry(async()=>parseFloat(ethers.formatEther((await votingEscrow.staked(AERO_STAKE_ID)).amount)));
+  console.log(`✓ AERO locked (stake #${AERO_STAKE_ID}):`, aeroLocked);
 
   const liqMinted   = await retry(async()=>parseFloat(ethers.formatEther(await vault.totalLIQMinted())));
-  const iaeroMinted = await retry(async()=>parseFloat(ethers.formatEther(await vault.totalIAEROMinted())));
+  const iaeroMinted = await retry(async()=>parseFloat(ethers.formatEther(await iaeroToken.totalSupply())));
   console.log('✓ LIQ minted:',  liqMinted);
   console.log('✓ iAERO minted:',iaeroMinted);
 
@@ -844,6 +852,34 @@ function scheduleNextTweet(){
   }, ms);
 }
 
+/* ============================== Daily stats tweet ======================= */
+function buildDailyStatsTweet(stats) {
+  const statsTweet =
+`📊 iAERO Daily Stats
+💰 TVL: ${stats.tvl}
+📈 APY: ${stats.apy}%
+🔒 AERO Locked: ${stats.aeroLocked}
+💎 iAERO Minted: ${stats.totalStaked}
+🪙 LIQ Minted: ${stats.liqMinted}
+
+Prices:
+• AERO: $${stats.aeroPrice}
+• LIQ: $${stats.liqPrice}
+• iAERO/AERO: ${stats.iAeroPeg}
+
+Lock. Stake. Earn. Stay liquid.`;
+  return safeTrimTweet(statsTweet, 280);
+}
+
+async function dryRunStats() {
+  const stats = await getProtocolStats(true);
+  console.log('Stats:', stats);
+  console.log('\n----- DRY RUN: daily stats tweet (NOT posted) -----');
+  console.log(buildDailyStatsTweet(stats));
+  console.log('---------------------------------------------------');
+  if (!stats || stats.tvl === '0') console.log('NOTE: TVL is 0, so the live bot would skip this tweet.');
+}
+
 /* ============================== Bootstrap =============================== */
 async function startBot(){
   console.log('🤖 iAERO Twitter Bot starting (Production Version)…');
@@ -858,7 +894,8 @@ async function startBot(){
     hasOpenAI:       OPENAI_ENABLED,
     model:           OPENAI_MODEL,
     tweetsEnabled:   TWEETS_ENABLED,
-    vaultAddress:    process.env.VAULT_ADDRESS || '0x877398Aea8B5cCB0D482705c2D88dF768c953957',
+    vaultAddress:    process.env.VAULT_ADDRESS || '0x180DAB53968e599Dd43CF431E27CB01AA5C37909',
+    aeroStakeId:     process.env.PROTOCOL_AERO_STAKE_ID || '1584',
     rpcUrl:          process.env.RPC_URL ? 'custom' : 'default Base RPC'
   });
 
@@ -900,21 +937,7 @@ async function startBot(){
     console.log('Posting daily stats tweet…');
     const stats = await getProtocolStats(true);
     if (stats && stats.tvl !== '0') {
-      let statsTweet =
-`📊 iAERO Daily Stats
-💰 TVL: ${stats.tvl}
-📈 APY: ${stats.apy}%
-🔒 AERO Locked: ${stats.aeroLocked}
-💎 iAERO Minted: ${stats.totalStaked}
-🪙 LIQ Minted: ${stats.liqMinted}
-
-Prices:
-• AERO: $${stats.aeroPrice}
-• LIQ: $${stats.liqPrice}
-• iAERO/AERO: ${stats.iAeroPeg}
-
-Lock. Stake. Earn. Stay liquid.`;
-      statsTweet = safeTrimTweet(statsTweet, 280);
+      const statsTweet = buildDailyStatsTweet(stats);
       const h = hashTweet(statsTweet);
       if (postedHashes.has(h)) { console.log('Daily stats tweet identical; skipping'); return; }
 
@@ -962,4 +985,8 @@ process.on('uncaughtException', async err => { console.error('Uncaught exception
 process.on('SIGTERM', async ()=>{ console.log('SIGTERM: saving state…'); await Promise.allSettled([saveHashes(), saveTweetLog()]); process.exit(0); });
 process.on('SIGINT',  async ()=>{ console.log('SIGINT: saving state…');  await Promise.allSettled([saveHashes(), saveTweetLog()]); process.exit(0); });
 
-startBot().catch(async err => { console.error('Failed to start bot:', err); await Promise.allSettled([saveHashes(), saveTweetLog()]); process.exit(1); });
+if (DRY_RUN_STATS) {
+  dryRunStats().then(() => process.exit(0)).catch(err => { console.error('Dry run failed:', err); process.exit(1); });
+} else {
+  startBot().catch(async err => { console.error('Failed to start bot:', err); await Promise.allSettled([saveHashes(), saveTweetLog()]); process.exit(1); });
+}

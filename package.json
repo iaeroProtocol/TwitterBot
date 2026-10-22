@@ -4,7 +4,8 @@
   "type": "module",
   "scripts": {
     "start": "node twitter-bot.mjs",
-    "dev": "node --watch twitter-bot.mjs"
+    "dev": "node --watch twitter-bot.mjs",
+    "stats:dry-run": "node twitter-bot.mjs --dry-run-stats"
   },
   "dependencies": {
     "dotenv": "^16.0.3",

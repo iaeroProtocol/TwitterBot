@@ -14,21 +14,25 @@ import { fileURLToPath } from 'url';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname  = path.dirname(__filename);
 
+// Dry run: `node twitter-bot.mjs --dry-run-stats` (or DRY_RUN_STATS=1) prints the daily stats
+// tweet and exits. No Twitter/OpenAI clients, no health server, nothing is posted.
+const DRY_RUN_STATS = process.argv.includes('--dry-run-stats') || process.env.DRY_RUN_STATS === '1';
+
 /* ============================== Healthcheck ============================= */
 const app  = express();
 const PORT = process.env.PORT || 8080;
 app.get('/health', (_req, res) => res.status(200).json({ status: 'ok', uptime: process.uptime() }));
-app.listen(PORT, () => console.log(`Health check server on :${PORT}`));
+if (!DRY_RUN_STATS) app.listen(PORT, () => console.log(`Health check server on :${PORT}`));
 
 /* ============================== Clients ================================= */
-const twitterClient = new TwitterApi({
+const twitterClient = DRY_RUN_STATS ? null : new TwitterApi({
   appKey:       process.env.TWITTER_API_KEY,
   appSecret:    process.env.TWITTER_API_SECRET,
   accessToken:  process.env.TWITTER_ACCESS_TOKEN,
   accessSecret: process.env.TWITTER_ACCESS_SECRET
 });
 
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+const openai = DRY_RUN_STATS ? null : new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 const TWEETS_ENABLED = process.env.TWEETS_ENABLED !== '0';
 const OPENAI_ENABLED     = !!process.env.OPENAI_API_KEY;
@@ -281,13 +285,22 @@ function safeTrimTweet(t, max=500){ const s=[...(t||'')]; return s.length<=max ?
 function pick(arr){ return arr[Math.floor(Math.random()*arr.length)]; }
 
 /* ============================== On-chain stats ========================== */
+// Pre-migration Aerodrome v2 factory. Its iAERO/LIQ pools were drained to dust on 2026-10-22, so a stale pool
+// env var would price from dust (old LIQ/USDC reads "LIQ: $142.56"). Aero v2 pools report 0x8E6a9FCd…76D2.
+const OLD_AERODROME_FACTORY = '0x420dd381b31aef6683db6b902084cb0ffece40da';
+// A price is only used when the pool holds at least this much of the quote token (USDC or AERO).
+const MIN_QUOTE_RESERVE = 1000;
+
 async function readPair(pairAddr) {
   const PAIR_ABI = [
     'function getReserves() view returns (uint256,uint256,uint256)',
     'function token0() view returns (address)',
-    'function token1() view returns (address)'
+    'function token1() view returns (address)',
+    'function factory() view returns (address)'
   ];
   const pair = new ethers.Contract(pairAddr, PAIR_ABI, provider);
+  const factory = (await pair.factory()).toLowerCase();
+  if (factory === OLD_AERODROME_FACTORY) throw new Error(`pool ${pairAddr} is an old Aerodrome pool (pre-migration); set the pool env vars to the Aero pools`);
   const token0 = (await pair.token0()).toLowerCase();
   const token1 = (await pair.token1()).toLowerCase();
   const [reserve0, reserve1] = await pair.getReserves();
@@ -301,7 +314,10 @@ async function resolveCoreTokens(cfg) {
   const liqPair = await readPair(cfg.LIQ_USDC_POOL);
   const LIQ  = (liqPair.token0 === usdc)  ? liqPair.token1  : liqPair.token0;
   const iaeroPair = await readPair(cfg.IAERO_AERO_POOL);
+  // Pool env vars must point at the same AERO (old Aerodrome AERO != new Aero AERO)
+  if (iaeroPair.token0 !== AERO && iaeroPair.token1 !== AERO) throw new Error('IAERO_AERO_POOL does not hold the AERO priced by AERO_USDC_POOL; set the pool env vars together');
   const IAERO = (iaeroPair.token0 === AERO) ? iaeroPair.token1 : iaeroPair.token0;
+  if (IAERO !== cfg.IAERO.toLowerCase()) throw new Error(`IAERO_AERO_POOL pairs AERO with ${IAERO}, not IAERO_ADDRESS ${cfg.IAERO}`);
 
   const decMap = new Map();
   async function putDecimals(addr) {
@@ -326,6 +342,7 @@ async function pairPrice(pairAddr, baseAddr, quoteAddr, decMap) {
   const baseFloat  = parseFloat(ethers.formatUnits(baseReserve, baseDec));
   const quoteFloat = parseFloat(ethers.formatUnits(quoteReserve, quoteDec));
   if (baseFloat === 0) throw new Error('zero base reserve');
+  if (!(quoteFloat >= MIN_QUOTE_RESERVE)) throw new Error(`pool ${pairAddr} holds ${quoteFloat} of the quote token (< ${MIN_QUOTE_RESERVE}); too thin to price`);
   return quoteFloat / baseFloat;
 }
 function docsContext() {
@@ -369,25 +386,43 @@ async function fetchGitBookContent() {
 
 /* ============================== Live APY from GitHub ==================== */
 const ESTIMATED_REWARDS_URL = 'https://raw.githubusercontent.com/iaeroProtocol/ChainProcessingBot/main/data/estimated_rewards_usd.json';
+// Older than this (more than a full weekly epoch), the APY is not tweeted.
+const APY_MAX_AGE_MS = 8 * 24 * 60 * 60 * 1000;
 
+// When the file was written: `updatedAt` (ISO; written by both the legacy keeper and ChainProcessingBot),
+// else ChainProcessingBot's `updateTimestamp` (unix seconds). Null if neither is usable.
+function estimatedRewardsUpdatedMs(data) {
+  const iso = Date.parse(data?.updatedAt);
+  if (isFinite(iso)) return iso;
+  const ts = Number(data?.updateTimestamp);
+  return (isFinite(ts) && ts > 0) ? ts * 1000 : null;
+}
+
+// Returns the APY as a "12.34" string, or null when there is no fresh, valid figure (the APY line is then omitted).
 async function fetchLiveAPY() {
   try {
     const res = await fetch(ESTIMATED_REWARDS_URL);
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const data = await res.json();
-    
-    const apy = data?.apyPct;
-    
-    if (typeof apy !== 'number' || !isFinite(apy)) {
-      console.warn('Invalid APY value in estimated_rewards_usd.json');
-      return '0.00';
+
+    const updatedMs = estimatedRewardsUpdatedMs(data);
+    if (updatedMs === null || Date.now() - updatedMs > APY_MAX_AGE_MS) {
+      console.warn(`estimated_rewards_usd.json is stale (updatedAt ${data?.updatedAt ?? 'missing'}); omitting APY`);
+      return null;
     }
-    
+
+    const apy = data?.apyPct;
+
+    if (typeof apy !== 'number' || !isFinite(apy)) {
+      console.warn('Invalid APY value in estimated_rewards_usd.json; omitting APY');
+      return null;
+    }
+
     console.log('✓ Live APY fetched:', apy.toFixed(2) + '%');
     return apy.toFixed(2);
   } catch (e) {
-    console.error('Failed to fetch live APY:', e?.message || e);
-    return '0.00';
+    console.error('Failed to fetch live APY; omitting APY:', e?.message || e);
+    return null;
   }
 }
 
@@ -397,53 +432,64 @@ async function getProtocolStats(force = false) {
     return statsCache.data;
   }
   console.log('Fetching fresh protocol stats...');
+  // Aero pools (2026-10-22 migration). The three pool vars must change together.
   const VAULT_ADDRESS   = process.env.VAULT_ADDRESS   || '0x180DAB53968e599Dd43CF431E27CB01AA5C37909';
-  const IAERO_AERO_POOL = process.env.IAERO_AERO_POOL || '0x08d49DA370ecfFBC4c6Fdd2aE82B2D6aE238Affd';
-  const LIQ_USDC_POOL   = process.env.LIQ_USDC_POOL   || '0x8966379fCD16F7cB6c6EA61077B6c4fAfECa28f4';
-  const AERO_USDC_POOL  = process.env.AERO_USDC_POOL  || '0x6cDcb1C4A4D1C3C6d054b27AC5B77e89eAFb971d';
+  const IAERO_AERO_POOL = process.env.IAERO_AERO_POOL || '0x72Decb30DFE4F6Cf7Db3ba1D58411dDda5ed903b';
+  const LIQ_USDC_POOL   = process.env.LIQ_USDC_POOL   || '0xE4553d8d7284192ab84346A9C9FFdb69dCE30C71';
+  const AERO_USDC_POOL  = process.env.AERO_USDC_POOL  || '0xF634058dC94e6BF8e828E27621320C423bC8B18E';
   const USDC_ADDRESS    = process.env.USDC_ADDRESS    || '0x833589fCD6EDb6E08f4c7C32D4f71b54bdA02913';
+  const IAERO_ADDRESS   = process.env.IAERO_ADDRESS   || '0x81034Fb34009115F215f5d5F564AAc9FfA46a1Dc';
+  const VOTING_ESCROW   = process.env.VOTING_ESCROW_ADDRESS || '0xBF7977E1521e9a3032bf7243Ee4712f311f13915';
+  const AERO_STAKE_ID   = process.env.PROTOCOL_AERO_STAKE_ID || '1584';
 
+  // V5 is frozen after the migration; it is only read for LIQ minted.
   const VAULT_ABI = [
-    'function totalAEROLocked() view returns (uint256)',
     'function totalLIQMinted() view returns (uint256)',
-    'function totalIAEROMinted() view returns (uint256)',
-    'function vaultStatus() view returns (uint256,uint256,uint256,uint256,uint256,uint256,uint256,uint256,uint256,bool,bool)',
-    'function getTotalValueLocked() view returns (uint256)'
+    'function totalIAEROMinted() view returns (uint256)'
   ];
   const vault = new ethers.Contract(VAULT_ADDRESS, VAULT_ABI, provider);
+  const votingEscrow = new ethers.Contract(VOTING_ESCROW, ['function staked(uint256) view returns (uint128 amount, uint48 end, bool isPermanent)'], provider);
+
 
   const retry = async (fn, fallback=0, tries=5) => {
+    let lastErr;
     for (let i=0;i<tries;i++){
       try { return await fn(); }
-      catch {
+      catch (e) {
+        lastErr = e;
         if (i<tries-1) await new Promise(r=>setTimeout(r, Math.min(1000*(2**i), 5000)));
       }
     }
+    console.error('Stats read failed after retries:', lastErr?.message || lastErr);
     return fallback;
   };
 
-  let aeroLocked = await retry(async()=>parseFloat(ethers.formatEther(await vault.totalAEROLocked())));
-  if (!aeroLocked) aeroLocked = await retry(async()=>parseFloat(ethers.formatEther(await vault.getTotalValueLocked())));
-  if (!aeroLocked) aeroLocked = await retry(async()=>{ const vs = await vault.vaultStatus(); return parseFloat(ethers.formatEther(vs[0])); });
-  console.log('✓ AERO locked:', aeroLocked);
+  // Backing = the protocol's permanent Aero stake on the VotingEscrow
+  const aeroLocked = await retry(async()=>parseFloat(ethers.formatEther((await votingEscrow.staked(AERO_STAKE_ID)).amount)));
+  console.log(`✓ AERO locked (stake #${AERO_STAKE_ID}):`, aeroLocked);
 
   const liqMinted   = await retry(async()=>parseFloat(ethers.formatEther(await vault.totalLIQMinted())));
+  // iAERO minted by the vault, as the tweet has always reported (not iAERO.totalSupply(); see decision #17).
   const iaeroMinted = await retry(async()=>parseFloat(ethers.formatEther(await vault.totalIAEROMinted())));
   console.log('✓ LIQ minted:',  liqMinted);
   console.log('✓ iAERO minted:',iaeroMinted);
 
+  // No default prices: a pool that fails or is rejected leaves NaN, and the stats tweets are skipped.
   let aeroPrice=NaN, liqPrice=NaN, iaeroPeg=NaN;
   try {
-    const { tokens, decimals } = await resolveCoreTokens({ AERO_USDC_POOL, LIQ_USDC_POOL, IAERO_AERO_POOL, USDC: USDC_ADDRESS });
-    aeroPrice = await retry(async()=>await pairPrice(AERO_USDC_POOL, tokens.AERO, tokens.USDC, decimals), 0);
-    liqPrice  = await retry(async()=>await pairPrice(LIQ_USDC_POOL,  tokens.LIQ,  tokens.USDC, decimals), 0);
-    iaeroPeg  = await retry(async()=>await pairPrice(IAERO_AERO_POOL,tokens.IAERO,tokens.AERO, decimals), 1);
+    const { tokens, decimals } = await resolveCoreTokens({ AERO_USDC_POOL, LIQ_USDC_POOL, IAERO_AERO_POOL, USDC: USDC_ADDRESS, IAERO: IAERO_ADDRESS });
+    aeroPrice = await retry(async()=>await pairPrice(AERO_USDC_POOL, tokens.AERO, tokens.USDC, decimals), NaN);
+    liqPrice  = await retry(async()=>await pairPrice(LIQ_USDC_POOL,  tokens.LIQ,  tokens.USDC, decimals), NaN);
+    iaeroPeg  = await retry(async()=>await pairPrice(IAERO_AERO_POOL,tokens.IAERO,tokens.AERO, decimals), NaN);
     console.log('✓ AERO price:', aeroPrice);
     console.log('✓ LIQ price:',  liqPrice);
     console.log('✓ iAERO peg:',  iaeroPeg);
   } catch(e){ console.error('Price fetching failed:', e?.message || e); }
 
-  const tvlFloat = (isFinite(aeroPrice) && aeroLocked>0) ? aeroLocked*aeroPrice : 0;
+  const pricesOk = [aeroPrice, liqPrice, iaeroPeg].every(p => isFinite(p) && p > 0);
+  if (!pricesOk) console.error('Pool prices missing or rejected; stats tweets will be skipped');
+  // TVL '0' is the skip signal for every stats tweet (daily, protocol, startup)
+  const tvlFloat = (pricesOk && aeroLocked>0) ? aeroLocked*aeroPrice : 0;
   console.log('=== PROTOCOL STATS ===');
   console.log('AERO Locked:', aeroLocked);
   console.log('AERO Price:', aeroPrice);
@@ -649,7 +695,7 @@ async function generateProtocolTweet(maxAttempts=5) {
 
     const statsCtx = includeStats
       ? `\nCurrent stats (weave naturally; no "with TVL of X and APY of Y"):
-TVL ${stats.tvl}, APY ${stats.apy}%, AERO locked ${stats.aeroLocked}, iAERO/AERO ${stats.iAeroPeg}`
+TVL ${stats.tvl}, ${stats.apy !== null ? `APY ${stats.apy}%, ` : ''}AERO locked ${stats.aeroLocked}, iAERO/AERO ${stats.iAeroPeg}`
       : '\nDo not include specific stats in this tweet.';
 
     const recentCtx = (recentTweets?.length||0)>0
@@ -844,6 +890,35 @@ function scheduleNextTweet(){
   }, ms);
 }
 
+/* ============================== Daily stats tweet ======================= */
+function buildDailyStatsTweet(stats) {
+  // stats.apy is null when estimated_rewards_usd.json is stale or unreadable: leave the line out
+  const apyLine = stats.apy !== null ? `\n📈 APY: ${stats.apy}%` : '';
+  const statsTweet =
+`📊 iAERO Daily Stats
+💰 TVL: ${stats.tvl}${apyLine}
+🔒 AERO Locked: ${stats.aeroLocked}
+💎 iAERO Minted: ${stats.totalStaked}
+🪙 LIQ Minted: ${stats.liqMinted}
+
+Prices:
+• AERO: $${stats.aeroPrice}
+• LIQ: $${stats.liqPrice}
+• iAERO/AERO: ${stats.iAeroPeg}
+
+Lock. Stake. Earn. Stay liquid.`;
+  return safeTrimTweet(statsTweet, 280);
+}
+
+async function dryRunStats() {
+  const stats = await getProtocolStats(true);
+  console.log('Stats:', stats);
+  console.log('\n----- DRY RUN: daily stats tweet (NOT posted) -----');
+  console.log(buildDailyStatsTweet(stats));
+  console.log('---------------------------------------------------');
+  if (!stats || stats.tvl === '0') console.log('NOTE: TVL is 0 (stake read failed, or a pool price is missing or rejected), so the live bot would skip this tweet.');
+}
+
 /* ============================== Bootstrap =============================== */
 async function startBot(){
   console.log('🤖 iAERO Twitter Bot starting (Production Version)…');
@@ -858,7 +933,8 @@ async function startBot(){
     hasOpenAI:       OPENAI_ENABLED,
     model:           OPENAI_MODEL,
     tweetsEnabled:   TWEETS_ENABLED,
-    vaultAddress:    process.env.VAULT_ADDRESS || '0x877398Aea8B5cCB0D482705c2D88dF768c953957',
+    vaultAddress:    process.env.VAULT_ADDRESS || '0x180DAB53968e599Dd43CF431E27CB01AA5C37909',
+    aeroStakeId:     process.env.PROTOCOL_AERO_STAKE_ID || '1584',
     rpcUrl:          process.env.RPC_URL ? 'custom' : 'default Base RPC'
   });
 
@@ -900,21 +976,7 @@ async function startBot(){
     console.log('Posting daily stats tweet…');
     const stats = await getProtocolStats(true);
     if (stats && stats.tvl !== '0') {
-      let statsTweet =
-`📊 iAERO Daily Stats
-💰 TVL: ${stats.tvl}
-📈 APY: ${stats.apy}%
-🔒 AERO Locked: ${stats.aeroLocked}
-💎 iAERO Minted: ${stats.totalStaked}
-🪙 LIQ Minted: ${stats.liqMinted}
-
-Prices:
-• AERO: $${stats.aeroPrice}
-• LIQ: $${stats.liqPrice}
-• iAERO/AERO: ${stats.iAeroPeg}
-
-Lock. Stake. Earn. Stay liquid.`;
-      statsTweet = safeTrimTweet(statsTweet, 280);
+      const statsTweet = buildDailyStatsTweet(stats);
       const h = hashTweet(statsTweet);
       if (postedHashes.has(h)) { console.log('Daily stats tweet identical; skipping'); return; }
 
@@ -962,4 +1024,8 @@ process.on('uncaughtException', async err => { console.error('Uncaught exception
 process.on('SIGTERM', async ()=>{ console.log('SIGTERM: saving state…'); await Promise.allSettled([saveHashes(), saveTweetLog()]); process.exit(0); });
 process.on('SIGINT',  async ()=>{ console.log('SIGINT: saving state…');  await Promise.allSettled([saveHashes(), saveTweetLog()]); process.exit(0); });
 
-startBot().catch(async err => { console.error('Failed to start bot:', err); await Promise.allSettled([saveHashes(), saveTweetLog()]); process.exit(1); });
+if (DRY_RUN_STATS) {
+  dryRunStats().then(() => process.exit(0)).catch(err => { console.error('Dry run failed:', err); process.exit(1); });
+} else {
+  startBot().catch(async err => { console.error('Failed to start bot:', err); await Promise.allSettled([saveHashes(), saveTweetLog()]); process.exit(1); });
+}

@@ -285,13 +285,22 @@ function safeTrimTweet(t, max=500){ const s=[...(t||'')]; return s.length<=max ?
 function pick(arr){ return arr[Math.floor(Math.random()*arr.length)]; }
 
 /* ============================== On-chain stats ========================== */
+// Pre-migration Aerodrome v2 factory. Its iAERO/LIQ pools were drained to dust on 2026-10-22, so a stale pool
+// env var would price from dust (old LIQ/USDC reads "LIQ: $142.56"). Aero v2 pools report 0x8E6a9FCd…76D2.
+const OLD_AERODROME_FACTORY = '0x420dd381b31aef6683db6b902084cb0ffece40da';
+// A price is only used when the pool holds at least this much of the quote token (USDC or AERO).
+const MIN_QUOTE_RESERVE = 1000;
+
 async function readPair(pairAddr) {
   const PAIR_ABI = [
     'function getReserves() view returns (uint256,uint256,uint256)',
     'function token0() view returns (address)',
-    'function token1() view returns (address)'
+    'function token1() view returns (address)',
+    'function factory() view returns (address)'
   ];
   const pair = new ethers.Contract(pairAddr, PAIR_ABI, provider);
+  const factory = (await pair.factory()).toLowerCase();
+  if (factory === OLD_AERODROME_FACTORY) throw new Error(`pool ${pairAddr} is an old Aerodrome pool (pre-migration); set the pool env vars to the Aero pools`);
   const token0 = (await pair.token0()).toLowerCase();
   const token1 = (await pair.token1()).toLowerCase();
   const [reserve0, reserve1] = await pair.getReserves();
@@ -308,6 +317,7 @@ async function resolveCoreTokens(cfg) {
   // Pool env vars must point at the same AERO (old Aerodrome AERO != new Aero AERO)
   if (iaeroPair.token0 !== AERO && iaeroPair.token1 !== AERO) throw new Error('IAERO_AERO_POOL does not hold the AERO priced by AERO_USDC_POOL; set the pool env vars together');
   const IAERO = (iaeroPair.token0 === AERO) ? iaeroPair.token1 : iaeroPair.token0;
+  if (IAERO !== cfg.IAERO.toLowerCase()) throw new Error(`IAERO_AERO_POOL pairs AERO with ${IAERO}, not IAERO_ADDRESS ${cfg.IAERO}`);
 
   const decMap = new Map();
   async function putDecimals(addr) {
@@ -332,6 +342,7 @@ async function pairPrice(pairAddr, baseAddr, quoteAddr, decMap) {
   const baseFloat  = parseFloat(ethers.formatUnits(baseReserve, baseDec));
   const quoteFloat = parseFloat(ethers.formatUnits(quoteReserve, quoteDec));
   if (baseFloat === 0) throw new Error('zero base reserve');
+  if (!(quoteFloat >= MIN_QUOTE_RESERVE)) throw new Error(`pool ${pairAddr} holds ${quoteFloat} of the quote token (< ${MIN_QUOTE_RESERVE}); too thin to price`);
   return quoteFloat / baseFloat;
 }
 function docsContext() {
@@ -375,25 +386,43 @@ async function fetchGitBookContent() {
 
 /* ============================== Live APY from GitHub ==================== */
 const ESTIMATED_REWARDS_URL = 'https://raw.githubusercontent.com/iaeroProtocol/ChainProcessingBot/main/data/estimated_rewards_usd.json';
+// Older than this (more than a full weekly epoch), the APY is not tweeted.
+const APY_MAX_AGE_MS = 8 * 24 * 60 * 60 * 1000;
 
+// When the file was written: `updatedAt` (ISO; written by both the legacy keeper and ChainProcessingBot),
+// else ChainProcessingBot's `updateTimestamp` (unix seconds). Null if neither is usable.
+function estimatedRewardsUpdatedMs(data) {
+  const iso = Date.parse(data?.updatedAt);
+  if (isFinite(iso)) return iso;
+  const ts = Number(data?.updateTimestamp);
+  return (isFinite(ts) && ts > 0) ? ts * 1000 : null;
+}
+
+// Returns the APY as a "12.34" string, or null when there is no fresh, valid figure (the APY line is then omitted).
 async function fetchLiveAPY() {
   try {
     const res = await fetch(ESTIMATED_REWARDS_URL);
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const data = await res.json();
-    
-    const apy = data?.apyPct;
-    
-    if (typeof apy !== 'number' || !isFinite(apy)) {
-      console.warn('Invalid APY value in estimated_rewards_usd.json');
-      return '0.00';
+
+    const updatedMs = estimatedRewardsUpdatedMs(data);
+    if (updatedMs === null || Date.now() - updatedMs > APY_MAX_AGE_MS) {
+      console.warn(`estimated_rewards_usd.json is stale (updatedAt ${data?.updatedAt ?? 'missing'}); omitting APY`);
+      return null;
     }
-    
+
+    const apy = data?.apyPct;
+
+    if (typeof apy !== 'number' || !isFinite(apy)) {
+      console.warn('Invalid APY value in estimated_rewards_usd.json; omitting APY');
+      return null;
+    }
+
     console.log('✓ Live APY fetched:', apy.toFixed(2) + '%');
     return apy.toFixed(2);
   } catch (e) {
-    console.error('Failed to fetch live APY:', e?.message || e);
-    return '0.00';
+    console.error('Failed to fetch live APY; omitting APY:', e?.message || e);
+    return null;
   }
 }
 
@@ -423,12 +452,15 @@ async function getProtocolStats(force = false) {
 
 
   const retry = async (fn, fallback=0, tries=5) => {
+    let lastErr;
     for (let i=0;i<tries;i++){
       try { return await fn(); }
-      catch {
+      catch (e) {
+        lastErr = e;
         if (i<tries-1) await new Promise(r=>setTimeout(r, Math.min(1000*(2**i), 5000)));
       }
     }
+    console.error('Stats read failed after retries:', lastErr?.message || lastErr);
     return fallback;
   };
 
@@ -442,18 +474,22 @@ async function getProtocolStats(force = false) {
   console.log('✓ LIQ minted:',  liqMinted);
   console.log('✓ iAERO minted:',iaeroMinted);
 
+  // No default prices: a pool that fails or is rejected leaves NaN, and the stats tweets are skipped.
   let aeroPrice=NaN, liqPrice=NaN, iaeroPeg=NaN;
   try {
-    const { tokens, decimals } = await resolveCoreTokens({ AERO_USDC_POOL, LIQ_USDC_POOL, IAERO_AERO_POOL, USDC: USDC_ADDRESS });
-    aeroPrice = await retry(async()=>await pairPrice(AERO_USDC_POOL, tokens.AERO, tokens.USDC, decimals), 0);
-    liqPrice  = await retry(async()=>await pairPrice(LIQ_USDC_POOL,  tokens.LIQ,  tokens.USDC, decimals), 0);
-    iaeroPeg  = await retry(async()=>await pairPrice(IAERO_AERO_POOL,tokens.IAERO,tokens.AERO, decimals), 1);
+    const { tokens, decimals } = await resolveCoreTokens({ AERO_USDC_POOL, LIQ_USDC_POOL, IAERO_AERO_POOL, USDC: USDC_ADDRESS, IAERO: IAERO_ADDRESS });
+    aeroPrice = await retry(async()=>await pairPrice(AERO_USDC_POOL, tokens.AERO, tokens.USDC, decimals), NaN);
+    liqPrice  = await retry(async()=>await pairPrice(LIQ_USDC_POOL,  tokens.LIQ,  tokens.USDC, decimals), NaN);
+    iaeroPeg  = await retry(async()=>await pairPrice(IAERO_AERO_POOL,tokens.IAERO,tokens.AERO, decimals), NaN);
     console.log('✓ AERO price:', aeroPrice);
     console.log('✓ LIQ price:',  liqPrice);
     console.log('✓ iAERO peg:',  iaeroPeg);
   } catch(e){ console.error('Price fetching failed:', e?.message || e); }
 
-  const tvlFloat = (isFinite(aeroPrice) && aeroLocked>0) ? aeroLocked*aeroPrice : 0;
+  const pricesOk = [aeroPrice, liqPrice, iaeroPeg].every(p => isFinite(p) && p > 0);
+  if (!pricesOk) console.error('Pool prices missing or rejected; stats tweets will be skipped');
+  // TVL '0' is the skip signal for every stats tweet (daily, protocol, startup)
+  const tvlFloat = (pricesOk && aeroLocked>0) ? aeroLocked*aeroPrice : 0;
   console.log('=== PROTOCOL STATS ===');
   console.log('AERO Locked:', aeroLocked);
   console.log('AERO Price:', aeroPrice);
@@ -659,7 +695,7 @@ async function generateProtocolTweet(maxAttempts=5) {
 
     const statsCtx = includeStats
       ? `\nCurrent stats (weave naturally; no "with TVL of X and APY of Y"):
-TVL ${stats.tvl}, APY ${stats.apy}%, AERO locked ${stats.aeroLocked}, iAERO/AERO ${stats.iAeroPeg}`
+TVL ${stats.tvl}, ${stats.apy !== null ? `APY ${stats.apy}%, ` : ''}AERO locked ${stats.aeroLocked}, iAERO/AERO ${stats.iAeroPeg}`
       : '\nDo not include specific stats in this tweet.';
 
     const recentCtx = (recentTweets?.length||0)>0
@@ -856,10 +892,11 @@ function scheduleNextTweet(){
 
 /* ============================== Daily stats tweet ======================= */
 function buildDailyStatsTweet(stats) {
+  // stats.apy is null when estimated_rewards_usd.json is stale or unreadable: leave the line out
+  const apyLine = stats.apy !== null ? `\n📈 APY: ${stats.apy}%` : '';
   const statsTweet =
 `📊 iAERO Daily Stats
-💰 TVL: ${stats.tvl}
-📈 APY: ${stats.apy}%
+💰 TVL: ${stats.tvl}${apyLine}
 🔒 AERO Locked: ${stats.aeroLocked}
 💎 iAERO Minted: ${stats.totalStaked}
 🪙 LIQ Minted: ${stats.liqMinted}
@@ -879,7 +916,7 @@ async function dryRunStats() {
   console.log('\n----- DRY RUN: daily stats tweet (NOT posted) -----');
   console.log(buildDailyStatsTweet(stats));
   console.log('---------------------------------------------------');
-  if (!stats || stats.tvl === '0') console.log('NOTE: TVL is 0, so the live bot would skip this tweet.');
+  if (!stats || stats.tvl === '0') console.log('NOTE: TVL is 0 (stake read failed, or a pool price is missing or rejected), so the live bot would skip this tweet.');
 }
 
 /* ============================== Bootstrap =============================== */
